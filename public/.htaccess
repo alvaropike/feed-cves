@@ -1,0 +1,39 @@
+# Vite copia este fichero a dist/ en cada build, así que sube dist/.htaccess
+# junto al resto a public_html/.
+
+# ------------------------------------------------------- nada de sync por web
+# euvd_sync.php vive aquí dentro para que su __DIR__ apunte a data/, pero no
+# tiene por qué ser alcanzable desde fuera: una pasada completa son ~190 s de
+# CPU y unas cuantas peticiones a ENISA, el NVD y FIRST. Que lo lance el cron.
+<FilesMatch "^(euvd_sync\.php|euvd_env\.sh|\.notificado\.json|\.sync\.lock|.*\.tmp)$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</FilesMatch>
+
+# ------------------------------------------------------------------- caché
+# El cron reescribe los JSON cada 15 minutos: cinco de caché es margen de sobra
+# y evita que un proxy sirva una tabla de ayer. El resto del build (assets/)
+# lleva hash en el nombre, así que ese sí puede cachearse a lo bestia.
+<IfModule mod_headers.c>
+  <FilesMatch "\.json$">
+    Header set Cache-Control "max-age=300, must-revalidate"
+  </FilesMatch>
+  <FilesMatch "\.(js|css|woff2?)$">
+    Header set Cache-Control "max-age=31536000, immutable"
+  </FilesMatch>
+</IfModule>
+
+# ------------------------------------------------------------------ gzip
+# cves.json ronda los 6 MB en crudo y baja a ~1 MB comprimido. Es la diferencia
+# entre que la tabla cargue o que el móvil se rinda.
+<IfModule mod_deflate.c>
+  AddOutputFilterByType DEFLATE application/json application/javascript text/css text/html
+</IfModule>
+
+# ------------------------------------------------------------- listados off
+Options -Indexes
