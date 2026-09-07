@@ -14,8 +14,11 @@ Dos motivos. Uno, no se puede dar por hecho que la API envíe cabeceras CORS, as
 petición, así que "todas las últimas" implica paginar: eso no lo quieres haciendo cada
 visitante, sino una vez por hora en el servidor.
 
-El resultado: `euvd_sync.php` corre por cron, pagina la API y deja un JSON plano.
-El React solo lee ese fichero. Rápido, sin rate limits, y la tabla sigue viva si la API se cae.
+El resultado: el sync pagina la API por su cuenta y deja un JSON plano. El React solo lee
+ese fichero. Rápido, sin rate limits, y la tabla sigue viva si la API se cae.
+
+Hay dos implementaciones equivalentes, `euvd_sync.mjs` (Node) y `euvd_sync.php`. La que
+corre en producción es la de Node, lanzada por **GitHub Actions**; ver "Dónde corre el sync".
 
 ## Estructura en el hosting
 
@@ -24,13 +27,17 @@ public_html/
 ├── index.html          ← build de Vite
 ├── assets/
 ├── data/
-│   ├── cves.json       ← lo escribe el cron
-│   ├── cve_meta.json   ← caché de títulos y CWE de cve.org, también del cron
+│   ├── cves.json       ← lo sube el workflow en cada pasada
+│   ├── cve_meta.json   ← caché de títulos y CWE de cve.org, también del workflow
 │   ├── scores_nvd.json ← caché de puntuaciones CVSS del NVD, ídem
 │   └── epss.json       ← última EPSS conocida de FIRST, red por si la API cae
-├── euvd_sync.php       ← mejor fuera de public_html si puedes
-└── .notificado.json    ← qué se ha avisado ya por Telegram; junto al script, no en data/
+└── .notificado.json    ← qué se ha avisado ya por Telegram; fuera de data/, que se publica
 ```
+
+El hosting no ejecuta nada: solo guarda lo que el workflow deja ahí. Las cachés y
+`.notificado.json` viven aquí porque el runner de Actions es efímero y las necesita entre
+pasadas — ver "Dónde corre el sync". El `.htaccess` bloquea `.notificado.json`, `.sync.lock`
+y los `.tmp`, que son estado interno y no datos del feed.
 
 ## Montaje
 
@@ -38,22 +45,17 @@ public_html/
    `FeedVulnerabilidades.jsx` como componente en `App.jsx`. No necesita Tailwind ni
    dependencias: los estilos van embebidos.
 
-2. **Sync.** Sube `euvd_sync.php` y ajusta `$destino` para que apunte a la carpeta
-   `data/` del sitio publicado. Pruébalo a mano:
+2. **Sync.** Pruébalo a mano antes de automatizar nada:
 
    ```bash
-   php euvd_sync.php
+   npm run sync            # pasada completa
+   npm run sync:rapido     # solo EUVD + cve.org + KEV
    ```
 
-3. **Cron** (hPanel → Avanzado → Trabajos cron), dos cadencias:
-
-   ```
-   */15 * * * * NVD_API_KEY=… /usr/bin/php ~/euvd_sync.php --rapido >> ~/logs/euvd.log 2>&1
-   17 */6 * * * NVD_API_KEY=… /usr/bin/php ~/euvd_sync.php           >> ~/logs/euvd.log 2>&1
-   ```
-
-   Ver "Dos cadencias" más abajo. Ponle un `logrotate` o un truncado al log, que si
-   no crece sin fin.
+3. **Automatizarlo.** `.github/workflows/sync.yml` lo hace por ti; ver "Dónde corre el
+   sync" para los secretos que hay que darle. Si prefieres cron en tu hosting, sube
+   `euvd_sync.php` al directorio publicado —usa `__DIR__`, así que escribe en el `data/`
+   que tenga al lado— y ponle las dos cadencias de "Dos cadencias".
 
 4. **Cabeceras.** En `.htaccess`, para que el JSON no se quede pegado en caché:
 
@@ -62,6 +64,41 @@ public_html/
      Header set Cache-Control "max-age=300, must-revalidate"
    </Files>
    ```
+
+## Dónde corre el sync
+
+En **GitHub Actions**, no en el hosting: `.github/workflows/sync.yml`. Reutiliza
+`euvd_sync.mjs` sin cambios, porque solo importa builtins de Node y no necesita
+`npm install`.
+
+Cada pasada hace tres cosas en este orden: baja el estado previo del servidor por FTP,
+ejecuta el sync y sube el resultado. Ese primer paso es el que no se puede saltar — el
+runner es efímero, así que sin él cada ejecución pediría los ~5.000 títulos a cve.org en
+vez de los pocos nuevos, y Telegram volvería a sembrar `.notificado.json` sin avisar nunca
+de nada. El servidor es la fuente de verdad de ese estado.
+
+`cves.json` se sube a `.tmp` y se renombra, que es lo que hacía `escribir_json()` cuando el
+script corría en el servidor: una subida de 6 MB por FTP no es atómica y un visitante podría
+llevarse el JSON a medias.
+
+Los secretos van en Settings → Secrets and variables → Actions:
+
+| Secreto | Para qué |
+|---|---|
+| `FTP_HOST`, `FTP_USER`, `FTP_PASSWORD` | publicar el resultado |
+| `NVD_API_KEY` | opcional; sube el límite del NVD de 5 a 50 peticiones/30 s |
+| `TELEGRAM_BOT_TOKEN` | opcional; sin él el sync corre igual y no avisa |
+| `TELEGRAM_CHAT_KEV`, `_CRITICAS`, `_ALTAS`, `_MEDIAS`, `_BAJAS`, `_SIN_PUNTUAR` | una sala por criticidad; ver "Avisos por Telegram" |
+
+Las rutas del FTP son **relativas al directorio de entrada de la cuenta**, que debe ser el
+docroot. El primer paso del workflow hace `ls data` justamente para verificarlo: si algún
+día la cuenta aterrizara en otro sitio, el job corta ahí en vez de subir el feed a un
+directorio que nadie sirve.
+
+Dos avisos. El `schedule` **solo se ejecuta desde la rama por defecto**, así que en una rama
+no arranca. Y a 15 minutos salen ~5.800 min/mes: por encima de los 2.000 que da un repo
+privado, de ahí que este esté público — en repos públicos Actions es ilimitado. Si lo
+quieres privado, baja la cadencia a una pasada por hora.
 
 ## Dos cadencias: pasada rápida y pasada completa
 
@@ -93,8 +130,9 @@ JSON lleva un campo `modo` (`"rapido"` o `"completo"`) que dice cómo se generó
 
 ## Un solo sync a la vez
 
-Con el cron cada 15 minutos y pasadas completas de tres, dos ejecuciones solapadas se
-pisarían las cachés y el rename atómico. Los dos scripts toman un cerrojo en `.sync.lock`
+Con una pasada cada 15 minutos y completas de tres, dos ejecuciones solapadas se pisarían
+las cachés y el rename atómico. En Actions eso lo evita el `concurrency` del workflow; al
+correr por cron, los dos scripts toman un cerrojo en `.sync.lock`
 antes de empezar y, si ya hay otro corriendo, **salen con código 0** — no es un error, así
 que el cron no te manda un correo cada cuarto de hora.
 
@@ -166,16 +204,15 @@ al partirlos.
    El `chat.id` sale en la respuesta. Los de grupo y canal van en negativo
    (`-1001234567890`), y el menos forma parte del id.
 
-3. Pásale al cron el token y las salas que hayas montado, en las dos cadencias:
+3. Dale al sync el token y las salas que hayas montado. En Actions son secretos del repo
+   (ver "Dónde corre el sync"); en local, un `.env` a partir de `.env.example`, o los
+   `export` a mano.
 
-   ```
-   0,15,30,45 * * * *  TELEGRAM_BOT_TOKEN=… TELEGRAM_CHAT_KEV=… TELEGRAM_CHAT_CRITICAS=… TELEGRAM_CHAT_ALTAS=… NVD_API_KEY=… /usr/bin/php ~/euvd_sync.php --rapido >> ~/logs/euvd.log 2>&1
-   17 0,6,12,18 * * *  TELEGRAM_BOT_TOKEN=… TELEGRAM_CHAT_KEV=… TELEGRAM_CHAT_CRITICAS=… TELEGRAM_CHAT_ALTAS=… NVD_API_KEY=… /usr/bin/php ~/euvd_sync.php >> ~/logs/euvd.log 2>&1
-   ```
-
-   Si la línea se te hace inmanejable —o no quieres el token a la vista en el panel—, mete
-   los `export` en un `~/euvd_env.sh` con `chmod 600` y llama a
-   `. ~/euvd_env.sh && /usr/bin/php ~/euvd_sync.php --rapido`.
+   Si lo lanzas por cron en un hosting, mete los `export` en un `euvd_env.sh` con
+   `chmod 600` **fuera del directorio publicado** y sourcéalo desde la línea del cron. Usa
+   rutas absolutas para todo: un `>>` a un directorio de logs que no existe hace fallar la
+   redirección, y la shell aborta el comando entero antes de ejecutar el script — sin
+   dejar rastro de por qué.
 
 Sin token o sin ninguna sala, el sync corre exactamente igual y no avisa: la web no depende
 de esto.
@@ -287,11 +324,11 @@ ya se está explotando va delante.
 
 Los avisos van **después** de escribir `cves.json` a propósito: que Telegram no conteste no
 puede dejar la web sin actualizar. Todo lo que pasa —lo enviado por sala, lo encolado, los
-errores— queda en el log del cron.
+errores— queda en el log de la ejecución.
 
 ## Parámetros que querrás tocar
 
-En `euvd_sync.php`:
+En `euvd_sync.mjs` y `euvd_sync.php` (los nombres son equivalentes en ambos):
 
 - `VENTANA_DIAS` — días hacia atrás. 14 da un volumen manejable; 30 engorda bastante el JSON.
 - `MAX_PAGINAS` — tope de seguridad. 60 páginas = 6.000 registros. **No lo bajes sin
@@ -299,14 +336,14 @@ En `euvd_sync.php`:
   con un `AVISO:` y la web saca una banda, porque lo que se pierde no son las más antiguas
   sino las que la API no llegue a devolver. Con 14 días son ~5.000, así que 25 páginas se
   quedaban justo con la mitad.
-- `PAUSA_US` — pausa entre peticiones. No lo bajes de 0,3 s.
+- `PAUSA_US` / `PAUSA_MS` — pausa entre peticiones. No lo bajes de 0,3 s.
 - `CONCURRENCIA_TITULOS` — peticiones simultáneas a cve.org. 6 va sobrado; subirlo
   arriesga que te empiecen a devolver 429.
 - `NVD_MARGEN_DIAS` — días extra de margen al pedir puntuaciones al NVD (ver más abajo).
 - `EPSS_TANDA` — CVE por petición a FIRST. 100 es el máximo que admite la API.
 - `NVD_API_KEY` — variable de entorno opcional. Sin ella el NVD deja 5 peticiones cada
   30 s; con ella, 50. Se pide gratis en <https://nvd.nist.gov/developers/request-an-api-key>
-  y en el cron sería `0 * * * * NVD_API_KEY=… /usr/bin/php …`.
+  Es el secreto `NVD_API_KEY` del repo.
 
 Con la ventana entera el JSON ronda los 6 MB, así que **sirve el `data/` con gzip**
 (`AddOutputFilterByType DEFLATE application/json` en el `.htaccess`); baja a ~1 MB. Si aun

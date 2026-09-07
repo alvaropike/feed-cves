@@ -132,6 +132,11 @@ jobs:
           TELEGRAM_CHAT_MEDIAS: ${{ secrets.TELEGRAM_CHAT_MEDIAS }}
           TELEGRAM_CHAT_BAJAS: ${{ secrets.TELEGRAM_CHAT_BAJAS }}
           TELEGRAM_CHAT_SIN_PUNTUAR: ${{ secrets.TELEGRAM_CHAT_SIN_PUNTUAR }}
+          # Respaldo para el montaje de un solo grupo: recoge lo que no tenga
+          # sala propia, filtrado por el umbral. Vacíos si no se definen, que es
+          # el valor por defecto del script.
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_UMBRAL: ${{ secrets.TELEGRAM_UMBRAL }}
         run: |
           if [ "$MODO" = "completo" ]; then
             node euvd_sync.mjs
