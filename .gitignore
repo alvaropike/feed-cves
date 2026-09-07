@@ -25,3 +25,6 @@ npm-debug.log*
 Thumbs.db
 .vscode/
 .idea/
+
+# Entorno del cron (lleva el token de Telegram)
+euvd_env.sh
