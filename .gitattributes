@@ -1,0 +1,7 @@
+# Los workflows y los scripts se ejecutan en Linux: un CRLF colado desde
+# Windows rompería los delimitadores de heredoc (EOF\r no cierra EOF).
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.mjs text eol=lf
+*.php text eol=lf

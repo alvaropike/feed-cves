@@ -1,0 +1,173 @@
+name: Sync EUVD
+
+# Sustituye al cron del hosting. El runner es efímero, así que el estado que el
+# sync necesita entre pasadas (las cachés y .notificado.json) vive en el
+# servidor: se baja antes de sincronizar y se sube después.
+#
+# euvd_sync.mjs no tiene dependencias fuera de Node, así que no hace falta
+# npm install: solo checkout, Node y a correr.
+
+on:
+  schedule:
+    # Pasada rápida: solo EUVD + cve.org + KEV (~40 s).
+    - cron: '0,15,30,45 * * * *'
+    # Pasada completa: además refresca CVSS del NVD y EPSS (~3 min).
+    - cron: '17 0,6,12,18 * * *'
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: 'Modo de la pasada'
+        type: choice
+        options: [rapido, completo]
+        default: rapido
+
+# Una pasada a la vez, igual que el cerrojo del script: dos ejecuciones
+# solapadas se pisarían las cachés en el servidor.
+concurrency:
+  group: sync-euvd
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Decidir el modo de la pasada
+        id: modo
+        env:
+          EVENTO: ${{ github.event_name }}
+          PROGRAMADO: ${{ github.event.schedule }}
+          ENTRADA: ${{ inputs.modo }}
+        run: |
+          if [ "$EVENTO" = "workflow_dispatch" ]; then
+            modo="$ENTRADA"
+          elif [ "$PROGRAMADO" = "17 0,6,12,18 * * *" ]; then
+            modo="completo"
+          else
+            modo="rapido"
+          fi
+          echo "modo=$modo" >> "$GITHUB_OUTPUT"
+          echo "Pasada: $modo"
+
+      - name: Instalar lftp
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lftp
+
+      # Falla a propósito si no conecta: sin este corte, unas credenciales
+      # malas se confundirían con "no hay estado previo" y el sync arrancaría
+      # de cero, pidiendo los 5.000 títulos a cve.org y re-sembrando Telegram.
+      #
+      # El pwd y el ls salen en el log de Actions: son los que te dicen qué
+      # poner en FTP_REMOTE_DIR la primera vez.
+      - name: Comprobar la conexión FTP
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+        run: |
+          lftp <<EOF
+          set ftp:ssl-force true
+          set ssl:verify-certificate no
+          set net:max-retries 2
+          set cmd:fail-exit yes
+          open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
+          echo "--- directorio al entrar por FTP:"
+          pwd
+          echo "--- que hay aqui:"
+          ls
+          echo "--- contenido de FTP_REMOTE_DIR ($FTP_REMOTE_DIR):"
+          ls "$FTP_REMOTE_DIR"
+          echo "--- y de su data/:"
+          ls "$FTP_REMOTE_DIR/data"
+          bye
+          EOF
+
+      # Sin este paso, cada ejecución empezaría de cero: pediría los 5.000
+      # títulos a cve.org y Telegram re-sembraría sin avisar nunca de nada.
+      #
+      # Aquí sí se toleran las ausencias (fail-exit queda en no): la primera
+      # vez no habrá .notificado.json, y eso es correcto, no un error.
+      - name: Traer el estado previo del servidor
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+        run: |
+          mkdir -p public/data
+          lftp <<EOF || true
+          set ftp:ssl-force true
+          set ssl:verify-certificate no
+          set net:max-retries 3
+          set xfer:clobber on
+          open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
+          mget -O public/data "$FTP_REMOTE_DIR/data/cve_meta.json"
+          mget -O public/data "$FTP_REMOTE_DIR/data/scores_nvd.json"
+          mget -O public/data "$FTP_REMOTE_DIR/data/epss.json"
+          get "$FTP_REMOTE_DIR/.notificado.json" -o .notificado.json
+          bye
+          EOF
+          echo "--- estado recuperado:"
+          ls -la public/data/ 2>/dev/null || true
+          if [ -f .notificado.json ]; then
+            node -e 'const s=require("./.notificado.json");console.log("  .notificado.json:",Object.keys(s.avisadas||{}).length,"entradas, sembrado",s.sembrado)'
+          else
+            echo "  (sin .notificado.json: Telegram sembrará esta pasada sin avisar)"
+          fi
+
+      - name: Sincronizar
+        env:
+          MODO: ${{ steps.modo.outputs.modo }}
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_KEV: ${{ secrets.TELEGRAM_CHAT_KEV }}
+          TELEGRAM_CHAT_CRITICAS: ${{ secrets.TELEGRAM_CHAT_CRITICAS }}
+          TELEGRAM_CHAT_ALTAS: ${{ secrets.TELEGRAM_CHAT_ALTAS }}
+          TELEGRAM_CHAT_MEDIAS: ${{ secrets.TELEGRAM_CHAT_MEDIAS }}
+          TELEGRAM_CHAT_BAJAS: ${{ secrets.TELEGRAM_CHAT_BAJAS }}
+          TELEGRAM_CHAT_SIN_PUNTUAR: ${{ secrets.TELEGRAM_CHAT_SIN_PUNTUAR }}
+        run: |
+          if [ "$MODO" = "completo" ]; then
+            node euvd_sync.mjs
+          else
+            node euvd_sync.mjs --rapido
+          fi
+
+      # Se sube a .tmp y se renombra, que es lo que hacía escribir_json() en el
+      # servidor: una subida de 6 MB por FTP no es atómica y un visitante podría
+      # llevarse el JSON a medias. El .htaccess ya bloquea los .tmp.
+      - name: Publicar en el hosting
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
+        run: |
+          lftp <<EOF
+          set ftp:ssl-force true
+          set ssl:verify-certificate no
+          set net:max-retries 3
+          set xfer:clobber on
+          open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
+          put public/data/cves.json      -o "$FTP_REMOTE_DIR/data/cves.json.tmp"
+          mv "$FTP_REMOTE_DIR/data/cves.json.tmp" "$FTP_REMOTE_DIR/data/cves.json"
+          put public/data/cve_meta.json   -o "$FTP_REMOTE_DIR/data/cve_meta.json"
+          put public/data/scores_nvd.json -o "$FTP_REMOTE_DIR/data/scores_nvd.json"
+          put public/data/epss.json       -o "$FTP_REMOTE_DIR/data/epss.json"
+          put .notificado.json            -o "$FTP_REMOTE_DIR/.notificado.json"
+          bye
+          EOF
+
+      - name: Resumen
+        run: |
+          node -e '
+            const s = JSON.parse(require("fs").readFileSync("public/data/cves.json","utf8"));
+            console.log("generado:", s.generado, "| modo:", s.modo, "| total:", s.total);
+          ' >> "$GITHUB_STEP_SUMMARY"
