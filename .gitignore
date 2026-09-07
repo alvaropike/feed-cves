@@ -1,0 +1,27 @@
+# Dependencias
+node_modules/
+
+# Build de Vite
+dist/
+
+# Datos generados por euvd_sync (se regeneran con: npm run sync)
+public/data/*.json
+
+# Estado local de notificaciones de Telegram
+.notificado.json
+*.tmp
+
+# Variables de entorno y secretos
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Sistema / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

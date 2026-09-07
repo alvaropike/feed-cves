@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Vulnerabilities published in the last days: CVSS from the NVD, EPSS by FIRST and known exploitation from CISA/EU KEV."
+    />
+    <title>Vulnerability feed (EUVD)</title>
+    <style>
+      html, body, #root { height: 100%; }
+      body { margin: 0; background: #0e1116; }
+      html.euvd-claro body { background: #f5f6f9; }
+    </style>
+    <script>
+      // El tema se decide antes de pintar nada: si esperase a que React monte,
+      // abrir la página en claro daría un destello negro a pantalla completa en
+      // cada recarga. Al cambiarlo desde la interfaz, React escribe el fondo en
+      // el style del body, que gana a esta regla.
+      (function () {
+        try {
+          var guardado = localStorage.getItem("euvd-tema");
+          var claro =
+            guardado === "light" ||
+            (!guardado && matchMedia("(prefers-color-scheme: light)").matches);
+          if (claro) {
+            document.documentElement.classList.add("euvd-claro");
+            document.documentElement.style.colorScheme = "light";
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
