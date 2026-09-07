@@ -63,14 +63,16 @@ jobs:
       # malas se confundirían con "no hay estado previo" y el sync arrancaría
       # de cero, pidiendo los 5.000 títulos a cve.org y re-sembrando Telegram.
       #
-      # El pwd y el ls salen en el log de Actions: son los que te dicen qué
-      # poner en FTP_REMOTE_DIR la primera vez.
+      # La cuenta FTP entra directamente en el docroot del subdominio, así que
+      # todo lo demás va con rutas relativas. El "ls data" lo verifica: si
+      # algún día la cuenta aterrizara en otro sitio, esto corta aquí en vez de
+      # subir el feed a un directorio que nadie sirve, que es exactamente el
+      # fallo mudo que traía el cron del hosting.
       - name: Comprobar la conexión FTP
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           lftp <<EOF
           set ftp:ssl-force true
@@ -82,10 +84,8 @@ jobs:
           pwd
           echo "--- que hay aqui:"
           ls
-          echo "--- contenido de FTP_REMOTE_DIR ($FTP_REMOTE_DIR):"
-          ls "$FTP_REMOTE_DIR"
-          echo "--- y de su data/:"
-          ls "$FTP_REMOTE_DIR/data"
+          echo "--- data/ (si esto falla, no estamos en el docroot):"
+          ls data
           bye
           EOF
 
@@ -99,7 +99,6 @@ jobs:
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           mkdir -p public/data
           lftp <<EOF || true
@@ -108,10 +107,10 @@ jobs:
           set net:max-retries 3
           set xfer:clobber on
           open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
-          mget -O public/data "$FTP_REMOTE_DIR/data/cve_meta.json"
-          mget -O public/data "$FTP_REMOTE_DIR/data/scores_nvd.json"
-          mget -O public/data "$FTP_REMOTE_DIR/data/epss.json"
-          get "$FTP_REMOTE_DIR/.notificado.json" -o .notificado.json
+          mget -O public/data "data/cve_meta.json"
+          mget -O public/data "data/scores_nvd.json"
+          mget -O public/data "data/epss.json"
+          get .notificado.json -o .notificado.json
           bye
           EOF
           echo "--- estado recuperado:"
@@ -148,7 +147,6 @@ jobs:
           FTP_HOST: ${{ secrets.FTP_HOST }}
           FTP_USER: ${{ secrets.FTP_USER }}
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
-          FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
         run: |
           lftp <<EOF
           set ftp:ssl-force true
@@ -156,12 +154,12 @@ jobs:
           set net:max-retries 3
           set xfer:clobber on
           open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
-          put public/data/cves.json      -o "$FTP_REMOTE_DIR/data/cves.json.tmp"
-          mv "$FTP_REMOTE_DIR/data/cves.json.tmp" "$FTP_REMOTE_DIR/data/cves.json"
-          put public/data/cve_meta.json   -o "$FTP_REMOTE_DIR/data/cve_meta.json"
-          put public/data/scores_nvd.json -o "$FTP_REMOTE_DIR/data/scores_nvd.json"
-          put public/data/epss.json       -o "$FTP_REMOTE_DIR/data/epss.json"
-          put .notificado.json            -o "$FTP_REMOTE_DIR/.notificado.json"
+          put public/data/cves.json      -o "data/cves.json.tmp"
+          mv "data/cves.json.tmp" "data/cves.json"
+          put public/data/cve_meta.json   -o "data/cve_meta.json"
+          put public/data/scores_nvd.json -o "data/scores_nvd.json"
+          put public/data/epss.json       -o "data/epss.json"
+          put .notificado.json            -o .notificado.json
           bye
           EOF
 
