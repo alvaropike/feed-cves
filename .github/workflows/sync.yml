@@ -9,9 +9,13 @@ name: Sync EUVD
 
 on:
   schedule:
-    # Pasada rápida: solo EUVD + cve.org + KEV (~40 s).
-    - cron: '0,15,30,45 * * * *'
-    # Pasada completa: además refresca CVSS del NVD y EPSS (~3 min).
+    # Solo la pasada completa. La rápida la dispara QStash cada 10 minutos, porque
+    # el schedule de GitHub no es puntual: se encola y se descarta en periodos de
+    # carga alta, y pidiendo cada 15 minutos salían 3 pasadas en 8 horas.
+    #
+    # Esta se queda aquí a propósito, como red de seguridad: si QStash se cae o el
+    # token caduca, la web sigue actualizándose cuatro veces al día en vez de
+    # quedarse congelada sin que nadie se entere.
     - cron: '17 0,6,12,18 * * *'
   workflow_dispatch:
     inputs:

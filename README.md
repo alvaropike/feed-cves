@@ -95,10 +95,32 @@ docroot. El primer paso del workflow hace `ls data` justamente para verificarlo:
 día la cuenta aterrizara en otro sitio, el job corta ahí en vez de subir el feed a un
 directorio que nadie sirve.
 
-Dos avisos. El `schedule` **solo se ejecuta desde la rama por defecto**, así que en una rama
-no arranca. Y a 15 minutos salen ~5.800 min/mes: por encima de los 2.000 que da un repo
-privado, de ahí que este esté público — en repos públicos Actions es ilimitado. Si lo
-quieres privado, baja la cadencia a una pasada por hora.
+### Quién dispara las pasadas
+
+La rápida la lanza **QStash de Upstash** cada 10 minutos, con un schedule que hace
+`workflow_dispatch` contra la API de GitHub. No es un capricho: el `schedule` de Actions no
+es puntual —los eventos programados se encolan y **se descartan en periodos de carga
+alta**—, y pidiendo cada 15 minutos salían tres pasadas en ocho horas.
+
+QStash reenvía al destino las cabeceras que le pases con el prefijo `Upstash-Forward-`; ahí
+va un PAT de GitHub *fine-grained* limitado a este repositorio y con **solo `Actions: Read
+and write`**, que es todo lo que necesita para lanzar el workflow y el mínimo daño posible
+si se filtra.
+
+La completa se queda en el `schedule` de GitHub a propósito, como red de seguridad: no
+necesita puntualidad, y si QStash se cae o el token caduca, la web sigue actualizándose
+cuatro veces al día en vez de quedarse congelada sin que nadie se entere — que es justo lo
+que pasó con el cron del hosting.
+
+El plan gratuito de QStash da 1.000 mensajes al día y 10 schedules; a 10 minutos se usan
+144 y uno. Subir la frecuencia cabría de sobra en ese cupo, pero el límite real es otro:
+cada pasada rápida pagina unas 50 peticiones a la EUVD, así que bajar a 5 minutos
+duplicaría la carga sobre una API pública gratuita sin que llegue nada antes — la EUVD
+publica en tandas durante el horario laboral europeo, no continuamente.
+
+Dos avisos sobre el `schedule`. **Solo se ejecuta desde la rama por defecto**, así que en
+una rama no arranca. Y a 15 minutos salían ~5.800 min/mes: por encima de los 2.000 que da
+un repo privado, de ahí que este esté público — en repos públicos Actions es ilimitado.
 
 ## Dos cadencias: pasada rápida y pasada completa
 
@@ -124,13 +146,13 @@ Merece la pena porque **el modelo EPSS se recalcula una vez al día** y el NVD t
 enriquecer: pedirlos cada quince minutos es bajar los mismos números. Lo único que trae
 vulnerabilidades nuevas es el listado de la EUVD, y cuesta 35 s.
 
-Cada 15 min la rápida y cada 6 h la completa deja las vulnerabilidades nuevas en la web en
-un cuarto de hora en vez de en una, sin cuadruplicar el tráfico contra el NVD ni FIRST. El
+Cada 10 min la rápida y cada 6 h la completa deja las vulnerabilidades nuevas en la web en
+diez minutos en vez de en una hora, sin cuadruplicar el tráfico contra el NVD ni FIRST. El
 JSON lleva un campo `modo` (`"rapido"` o `"completo"`) que dice cómo se generó.
 
 ## Un solo sync a la vez
 
-Con una pasada cada 15 minutos y completas de tres, dos ejecuciones solapadas se pisarían
+Con una pasada cada 10 minutos y completas de tres, dos ejecuciones solapadas se pisarían
 las cachés y el rename atómico. En Actions eso lo evita el `concurrency` del workflow; al
 correr por cron, los dos scripts toman un cerrojo en `.sync.lock`
 antes de empezar y, si ya hay otro corriendo, **salen con código 0** — no es un error, así
