@@ -33,13 +33,14 @@ docroot del subdominio/   ← NO ~/public_html, que es el dominio raíz y aloja 
 │   ├── cwes_nvd.json   ← caché de las CWE que añade el NVD, ídem
 │   ├── epss.json       ← última EPSS conocida de FIRST, red por si la API cae
 │   └── kev_extra.json  ← fichas de lo explotado que cae fuera de la ventana
+├── .vistas.json        ← qué entradas ha visto ya el feed; decide qué es nuevo
 └── .notificado.json    ← qué se ha avisado ya por Telegram; fuera de data/, que se publica
 ```
 
-El hosting no ejecuta nada: solo guarda lo que el workflow deja ahí. Las cachés y
-`.notificado.json` viven aquí porque el runner de Actions es efímero y las necesita entre
-pasadas — ver "Dónde corre el sync". El `.htaccess` bloquea `.notificado.json`, `.sync.lock`
-y los `.tmp`, que son estado interno y no datos del feed.
+El hosting no ejecuta nada: solo guarda lo que el workflow deja ahí. Las cachés y los dos
+ficheros de estado viven aquí porque el runner de Actions es efímero y los necesita entre
+pasadas — ver "Dónde corre el sync". El `.htaccess` bloquea `.vistas.json`,
+`.notificado.json`, `.sync.lock` y los `.tmp`, que son estado interno y no datos del feed.
 
 ## Montaje
 
@@ -498,31 +499,42 @@ de ese momento**; lo de la pausa no se avisa nunca.
 Lo que ya estaba publicado conserva su apunte —sala e identificador de mensaje—, así que al
 reanudar se puede seguir editando y mudando en vez de duplicarlo.
 
-### Empezar de cero sin avalancha
+### Lo que el feed ya ha visto
 
 Borrar el feed no basta para empezar de cero: la pasada siguiente vuelve a pedir los 14 días
-a la EUVD, lo rellena entero y Telegram toma por novedad todo lo que no tenga anotado. Para
-eso está `SYNC_DESDE`, también variable del repo: una marca de tiempo ISO por debajo de la
-cual **nada entra en el feed**, ni en la web ni en Telegram, que son la misma lista.
+a la EUVD, lo rellena entero y Telegram toma por novedad todo lo que no tenga anotado. Así
+salieron 900 avisos encolados de vulnerabilidades de hasta dos semanas.
 
-Con ella puesta, el feed arranca vacío y se va llenando con lo que vaya saliendo, hasta un
-máximo de `VENTANA_DIAS` (14) días:
+Lo que lo evita es `.vistas.json`, la memoria del feed: por cada identificador EUVD, **cuándo
+se vio por primera vez** y cuándo se vio por última. Con eso, lo que se publica en la web y
+lo que se avisa por Telegram —que son la misma lista, filtrada en un solo sitio— es
+únicamente lo que no se había visto antes.
 
-- **Lo de la ventana** entra por fecha de publicación y caduca solo porque la descarga deja
-  de pedirlo: lo que se pide son los últimos 14 días y punto.
-- **Lo del catálogo de KEV** entra por la fecha en que entró en el catálogo —que es lo que
-  ahí es noticia, no cuándo se publicó la CVE— y **caduca a los 14 días de entrar**. Es lo
-  que impide que se vuelvan a acumular las ~1.700 de siempre, casi todas de hace años. El
-  catálogo fecha por días, así que para estas el corte se compara por día: lo añadido hoy
-  entra aunque el corte se pusiera esta tarde.
+- **La primera pasada no publica nada.** Anota lo que hay y deja constancia en el log de
+  cuál es la última entrada. Es la "primera revisión": el fondo del que se parte.
+- **A partir de la segunda**, entra lo que no esté en esa lista, venga de la ventana o del
+  catálogo de KEV, y se queda **`VENTANA_DIAS` (14) días desde que se vio**, no desde que se
+  publicó. Lo del fondo inicial no entra nunca.
+- Una entrada deja de estar en el registro cuando lleva `VISTAS_OLVIDO_DIAS` (14) sin
+  aparecer. Ni un día menos: si se olvidara mientras la EUVD todavía la devuelve, la pasada
+  siguiente la tomaría por nueva y la volvería a ingerir.
 
-Es temporal por naturaleza: a los 14 días la ventana ya no alcanza al corte y deja de
-descartar nada, así que se puede borrar la variable y todo sigue igual. El precio, y solo
-durante esos 14 días, es que una vulnerabilidad que la EUVD publique con **fecha anterior**
-al corte no aparece —la EUVD rellena huecos hacia atrás—. Se prefiere eso a la avalancha.
+**Por qué por identificador y no por fecha.** La EUVD ordena por fecha de actualización, no
+de publicación, y las fichas asoman tarde: hay entradas publicadas hora y media antes de
+aparecer en el listado, y el catálogo rellena huecos hacia atrás. Un corte por reloj dejaría
+fuera **para siempre** todo lo que se publique antes del corte y aparezca después, que en un
+feed de vulnerabilidades es justo lo que no se puede perder. Con el registro da igual qué
+fecha traiga: si no se había visto, es nueva.
 
-La marca queda en `cves.json` como `corte`, para saber desde cuándo se está acumulando, y
-cada pasada deja en el log cuántas filas descartó y por qué.
+**Para volver a empezar**, se borra `.vistas.json` del servidor y la pasada siguiente vuelve
+a ser la primera revisión: web vacía y a acumular. Si además quieres que Telegram olvide lo
+avisado, eso es `reiniciar-avisos.yml`, que borra `.notificado.json`; son dos cosas
+distintas y se pueden hacer por separado.
+
+En `cves.json` quedan `desdeCero` —cuándo se hizo la primera revisión— y `conocidas` —cuántas
+entradas lleva vistas—, y la web dice que se está llenando mientras no haya pasado una
+ventana entera desde entonces. Cada pasada deja en el log cuántas entraron nuevas y cuántas
+se retiraron por antigüedad.
 
 ## Parámetros que querrás tocar
 
@@ -539,8 +551,10 @@ En `euvd_sync.mjs` y `euvd_sync.php` (los nombres son equivalentes en ambos):
   solo publicar una web incompleta: **lo que falta hoy entra mañana como si acabara de
   salir**, que fue lo que llenó la cola de Telegram con 900 avisos de vulnerabilidades de
   hasta dos semanas.
-- `TELEGRAM_PAUSA` / `SYNC_DESDE` — variables de entorno, no constantes; ver "El freno de
-  mano" y "Empezar de cero sin avalancha".
+- `VISTAS_OLVIDO_DIAS` — cuánto se recuerda una entrada que ha dejado de aparecer. **No lo
+  bajes de `VENTANA_DIAS`**: olvidar antes de que la EUVD deje de devolverla es reingerirla
+  entera. Ver "Lo que el feed ya ha visto".
+- `TELEGRAM_PAUSA` — variable de entorno, no constante; ver "El freno de mano".
 - `PAUSA_US` / `PAUSA_MS` — pausa entre peticiones. No lo bajes de 0,3 s.
 - `CONCURRENCIA_TITULOS` — peticiones simultáneas a cve.org. 6 va sobrado; subirlo
   arriesga que te empiecen a devolver 429.

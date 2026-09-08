@@ -6,7 +6,7 @@
 # euvd_sync.php vive aquí dentro para que su __DIR__ apunte a data/, pero no
 # tiene por qué ser alcanzable desde fuera: una pasada completa son ~190 s de
 # CPU y unas cuantas peticiones a ENISA, el NVD y FIRST. Que lo lance el cron.
-<FilesMatch "^(euvd_sync\.php|euvd_env\.sh|\.notificado\.json|\.sync\.lock|.*\.tmp)$">
+<FilesMatch "^(euvd_sync\.php|euvd_env\.sh|\.notificado\.json|\.vistas\.json|\.sync\.lock|.*\.tmp)$">
   <IfModule mod_authz_core.c>
     Require all denied
   </IfModule>

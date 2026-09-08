@@ -192,6 +192,7 @@ jobs:
           mget -O public/data "data/epss.json"
           mget -O public/data "data/kev_extra.json"
           get .notificado.json -o .notificado.json
+          get .vistas.json -o .vistas.json
           bye
           EOF
           echo "--- estado recuperado:"
@@ -200,6 +201,14 @@ jobs:
             node -e 'const s=require("./.notificado.json");console.log("  .notificado.json:",Object.keys(s.avisadas||{}).length,"entradas, sembrado",s.sembrado)'
           else
             echo "  (sin .notificado.json: Telegram sembrará esta pasada sin avisar)"
+          fi
+          # Sin este fichero la pasada es la primera revisión: anota lo que hay y no
+          # publica nada. Perderlo por un fallo del FTP vaciaría la web durante una
+          # pasada, así que conviene verlo en el log cuando falte.
+          if [ -f .vistas.json ]; then
+            node -e 'const s=require("./.vistas.json");console.log("  .vistas.json:",Object.keys(s.ids||{}).length,"entradas conocidas, desde",s.sembrado)'
+          else
+            echo "  (sin .vistas.json: esta pasada es la primera revisión y el feed sale vacío)"
           fi
 
       - name: Sincronizar
@@ -222,9 +231,6 @@ jobs:
           # publica la web como siempre pero no toca Telegram. Se quita borrando la
           # variable o poniendola a 0; no hace falta tocar el codigo.
           TELEGRAM_PAUSA: ${{ vars.TELEGRAM_PAUSA }}
-          # Arranque en frio, tambien variable del repo: marca ISO por debajo de la
-          # cual nada entra en el feed. Vacia = sin corte. Ver el README.
-          SYNC_DESDE: ${{ vars.SYNC_DESDE }}
         run: |
           if [ "$MODO" = "completo" ]; then
             node euvd_sync.mjs
@@ -256,6 +262,7 @@ jobs:
           put public/data/epss.json     -o "data/epss.json"
           put public/data/kev_extra.json -o "data/kev_extra.json"
           put .notificado.json          -o .notificado.json
+          put .vistas.json              -o .vistas.json
           bye
           EOF
 

@@ -7,7 +7,8 @@ dist/
 # Datos generados por euvd_sync (se regeneran con: npm run sync)
 public/data/*.json
 
-# Estado local de notificaciones de Telegram
+# Estado local: lo que el feed ya ha visto y lo que ya se ha avisado
+.vistas.json
 .notificado.json
 *.tmp
 

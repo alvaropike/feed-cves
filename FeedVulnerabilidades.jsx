@@ -591,6 +591,14 @@ export default function FeedVulnerabilidades() {
   // Las que están por explotadas y no por recientes: el sync las trae del catálogo
   // de KEV aunque su publicación quede fuera de la ventana. Se cuentan aparte
   // porque el recuento de arriba dice "en los últimos N días" y estas no lo están.
+  // El feed empieza vacío y tarda una ventana entera en estar lleno. Mientras
+  // tanto, ni la cuenta ni el aviso de paginación significan lo que parece.
+  const llenandose = useMemo(() => {
+    const desde = Date.parse(datos?.desdeCero ?? "");
+    if (Number.isNaN(desde)) return false;
+    return Date.now() - desde < (datos?.ventanaDias ?? 14) * 86400000;
+  }, [datos]);
+
   const fueraDeVentana = useMemo(() => items.filter((v) => v.fueraDeVentana).length, [items]);
   const enVentana = items.length - fueraDeVentana;
 
@@ -769,13 +777,14 @@ export default function FeedVulnerabilidades() {
           </div>
         </header>
 
-        {/* Con un corte puesto el feed arranca vacío y se va llenando, así que se
-            dice desde cuándo: si no, unas pocas filas en una ventana de 14 días
-            parecen una descarga rota en vez de un feed recién empezado. */}
-        {datos?.corte && (
+        {/* El feed arrancó vacío y se va llenando, así que se dice desde cuándo:
+            si no, unas pocas filas en una ventana de 14 días parecen una descarga
+            rota en vez de un feed recién empezado. Se calla cuando ya lleva más de
+            una ventana en marcha, que es cuando deja de ser una explicación. */}
+        {llenandose && (
           <div className="euvd-aviso">
-            Collecting from scratch since <b>{String(datos.corte).slice(0, 10)}</b>: only
-            vulnerabilities published after that show up here, and they drop off after{" "}
+            Collecting from scratch since <b>{String(datos.desdeCero).slice(0, 10)}</b>: only
+            vulnerabilities first seen after that show up here, and they drop off after{" "}
             {datos?.ventanaDias ?? 14} days.
           </div>
         )}
@@ -783,9 +792,10 @@ export default function FeedVulnerabilidades() {
         {/* `totalEnEuvd` es lo que la EUVD dice tener en la ventana, así que se
             compara con lo que vino de la ventana: sumarle lo sembrado por KEV
             taparía el aviso justo cuando la paginación se estuviera quedando corta.
-            Con un corte puesto la comparación no dice nada —sobran a propósito casi
-            todas—, así que el aviso se calla en vez de gritar cada pasada. */}
-        {!datos?.corte && datos?.totalEnEuvd > enVentana && (
+            Mientras el feed se está llenando la comparación no dice nada —faltan a
+            propósito casi todas—, así que el aviso se calla en vez de gritar cada
+            pasada. */}
+        {!llenandose && datos?.totalEnEuvd > enVentana && (
           <div className="euvd-aviso">
             The EUVD lists <b>{datos.totalEnEuvd}</b> vulnerabilities in this window but the
             JSON only holds <b>{enVentana}</b>. Raise <code>MAX_PAGINAS</code> in the sync:

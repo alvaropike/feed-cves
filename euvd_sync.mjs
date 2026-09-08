@@ -36,17 +36,11 @@ const PAGE_SIZE = 100; // máximo que admite la API
 // Telegram con 900 avisos de vulnerabilidades de hasta dos semanas.
 const MAX_PAGINAS = 100; // tope de seguridad: 100 * 100 = 10.000 registros
 
-// Arranque en frío. Nada anterior a esta marca entra en el feed, aunque la EUVD
-// lo siga devolviendo dentro de la ventana. Existe para poder vaciar el feed y
-// empezar de cero: sin ella, la pasada siguiente al borrado lo rellena otra vez
-// con los 14 días de historia que la API sigue trayendo, y Telegram los toma por
-// novedades. Es temporal por naturaleza: a los VENTANA_DIAS días la ventana ya no
-// alcanza al corte y deja de descartar nada, así que se puede quitar y todo sigue
-// igual. Vacía —lo normal— significa sin corte.
-//
-// El precio, y solo durante esos 14 días: una vulnerabilidad que la EUVD publique
-// con fecha anterior al corte no aparece. Se prefiere eso a la avalancha.
-const CORTE = process.env.SYNC_DESDE ?? "";
+// Cuánto se guarda una entrada en el registro después de dejar de aparecer. No es
+// la caducidad del feed —esa son VENTANA_DIAS desde que se vio— sino la memoria de
+// "esto ya lo conocía": si se olvidara antes de que la EUVD deje de devolverla,
+// la pasada siguiente la tomaría por nueva y volvería a ingerirla.
+const VISTAS_OLVIDO_DIAS = 14;
 const PAUSA_MS = 400; // 0,4 s entre peticiones, para no castigar la API
 const TIMEOUT_MS = 30000;
 const CONCURRENCIA_TITULOS = 6; // peticiones simultáneas a cve.org
@@ -147,6 +141,9 @@ const cacheEpss = join(AQUI, "public", "data", "epss.json");
 const cacheKev = join(AQUI, "public", "data", "kev_extra.json");
 // Fuera de data/: ese directorio se publica y esto es estado interno, no un dato del feed.
 const estadoTelegram = join(AQUI, ".notificado.json");
+// La memoria del feed: qué entradas ha visto ya y cuándo vio cada una por primera
+// vez. También fuera de data/, por lo mismo: es estado interno, no un dato.
+const registroVistas = join(AQUI, ".vistas.json");
 
 // ---------------------------------------------------------------- utilidades
 
@@ -1430,53 +1427,98 @@ async function tomarCerrojo() {
 }
 
 /**
- * Deja fuera del feed lo que no toca publicar: lo anterior al corte y lo que ya
- * ha cumplido sus VENTANA_DIAS. Se aplica al final, sobre las filas ya
- * enriquecidas, y lo que descarta no llega ni a la web ni a Telegram: son la
- * misma lista.
+ * La memoria del feed. Decide qué se publica comparando lo que trae la pasada con
+ * lo que ya se había visto antes, y devuelve solo lo nuevo, con su caducidad.
+ *
+ * Por qué por identificador y no por fecha: la EUVD ordena por fecha de
+ * actualización, no de publicación, y las fichas asoman tarde —se ven entradas
+ * publicadas hora y media antes de aparecer en el listado—. Un corte por reloj
+ * dejaría fuera para siempre todo lo que se publique antes del corte y aparezca
+ * después, que en un feed de vulnerabilidades es justo lo que no se puede perder.
+ * Con el registro da igual cuándo diga la EUVD que se publicó: si no se había
+ * visto, es nueva.
+ *
+ * La primera pasada no publica nada: anota las que hay y ya. Es lo que permite
+ * empezar de cero sin volcar de golpe los 14 días de historia que la API sigue
+ * devolviendo —y sin que Telegram los tome por novedades—. Para volver a empezar,
+ * se borra .vistas.json y la pasada siguiente vuelve a ser la primera.
  */
-function aplicarCorte(filas, ahora) {
-  const corte = Date.parse(CORTE);
-  if (Number.isNaN(corte)) {
-    if (CORTE) log(`AVISO: SYNC_DESDE no es una fecha ISO (${CORTE}); publico la ventana entera.`);
-    return filas;
-  }
+async function filtrarNuevas(filas, ahora) {
+  const estado = await leerCache(registroVistas);
+  const conocidas = estado.ids && typeof estado.ids === "object" ? estado.ids : {};
+  const primeraRevision = typeof estado.sembrado !== "string";
 
-  // El catálogo de KEV fecha por días, no por horas: lo que entró hoy viene
-  // marcado a medianoche y quedaría por detrás de un corte puesto a media tarde.
-  // Para esas filas el corte es el día, no el instante.
-  const corteDia = Date.parse(soloFecha(new Date(corte)));
-  const caduca = ahora.getTime() - VENTANA_DIAS * 86400000;
-  let previas = 0;
+  const ahoraIso = ahora.toISOString();
+  const ahoraMs = ahora.getTime();
+  // Lo anotado en la primera revisión lleva su misma marca de tiempo, y no se
+  // publica nunca: es justo el fondo del que se quería vaciar el feed. Solo sube
+  // a la web lo que se haya visto por primera vez después de ese momento.
+  const sembradoMs = Date.parse(estado.sembrado ?? ahoraIso);
+  const caduca = VENTANA_DIAS * 86400000;
+  const olvido = VISTAS_OLVIDO_DIAS * 86400000;
+
+  const vigentes = {};
+  const publicables = [];
   let caducadas = 0;
-  let sinFecha = 0;
+  let nuevas = 0;
 
-  const publicables = filas.filter((fila) => {
-    // Las que trae el catálogo de KEV no se miden por cuándo se publicó la CVE
-    // —casi todas son de hace años— sino por cuándo entraron en el catálogo,
-    // que es lo que ahí es noticia. Y caducan igual que el resto: a los 14 días
-    // de entrar salen del feed, que es lo que impide que se vuelvan a acumular
-    // las ~1.700 de siempre.
-    if (fila.fueraDeVentana) {
-      const entrada = Date.parse(fila.kev?.fecha ?? "");
-      if (Number.isNaN(entrada)) return sinFecha++, false;
-      if (entrada < corteDia) return previas++, false;
-      if (entrada < caduca) return caducadas++, false;
-      return true;
+  for (const fila of filas) {
+    const previa = conocidas[fila.euvd];
+    const primera = typeof previa?.p === "string" ? previa.p : null;
+
+    if (primera === null) {
+      vigentes[fila.euvd] = { p: ahoraIso, v: ahoraIso };
+      if (!primeraRevision) {
+        publicables.push(fila);
+        nuevas++;
+      }
+      continue;
     }
 
-    // Para el resto la caducidad ya la pone la propia ventana de la descarga:
-    // lo que se pide a la EUVD son los últimos VENTANA_DIAS días y punto.
-    const publicada = Date.parse(fila.fecha ?? fila.actualizado ?? "");
-    if (Number.isNaN(publicada)) return sinFecha++, false;
-    if (publicada < corte) return previas++, false;
-    return true;
+    // Se conserva la fecha del primer avistamiento: es la que manda la caducidad,
+    // no la de publicación. Una ficha que la EUVD publica con fecha de hace tres
+    // días entra hoy y se queda sus 14 días completos, que es lo útil.
+    vigentes[fila.euvd] = { p: primera, v: ahoraIso };
+    const desde = Date.parse(primera);
+    if (desde <= sembradoMs) continue; // del fondo inicial: ni se publica ni caduca
+    if (ahoraMs - desde <= caduca) publicables.push(fila);
+    else caducadas++;
+  }
+
+  // Lo que no ha venido en esta pasada sigue en el registro mientras no lleve
+  // demasiado sin verse. Si se olvidara antes de que la EUVD deje de devolverlo,
+  // la pasada siguiente lo tomaría por nuevo: así es como una descarga corta se
+  // convierte en una avalancha de avisos de cosas de hace dos semanas.
+  for (const [euvd, entrada] of Object.entries(conocidas)) {
+    if (vigentes[euvd]) continue;
+    const visto = Date.parse(entrada?.v ?? entrada?.p ?? "");
+    if (!Number.isNaN(visto) && ahoraMs - visto <= olvido) vigentes[euvd] = entrada;
+  }
+
+  await escribirJson(registroVistas, {
+    sembrado: estado.sembrado ?? ahoraIso,
+    ids: vigentes,
   });
 
+  if (primeraRevision) {
+    // La última entrada, que es la marca de la que cuelga todo lo demás: lo que
+    // llegue por delante de esta es lo que se ingiere en la revisión siguiente.
+    const ultima = filas.reduce(
+      (a, f) => (a && String(a.fecha) >= String(f.fecha) ? a : f),
+      null
+    );
+    log(
+      `Primera revisión: anotadas ${filas.length} entradas sin publicar ninguna. ` +
+        (ultima ? `La última es ${ultima.euvd} (${ultima.cve ?? "sin CVE"}), del ${ultima.fecha}. ` : "") +
+        "A partir de la pasada siguiente solo entra lo que no esté en esta lista."
+    );
+    return [];
+  }
+
   log(
-    `Corte en ${CORTE}: publico ${publicables.length} de ${filas.length} filas ` +
-      `(${previas} anteriores al corte, ${caducadas} de KEV pasadas de ${VENTANA_DIAS} días, ` +
-      `${sinFecha} sin fecha que mirar)`
+    `Registro: ${publicables.length} filas en el feed ` +
+      `(${nuevas} nuevas en esta pasada, ${caducadas} retiradas por pasar de ${VENTANA_DIAS} días, ` +
+      `${Object.keys(vigentes).length} conocidas en total)`
   );
   return publicables;
 }
@@ -1562,15 +1604,17 @@ await completarCwesNvd(filas);
 await completarEpss(filas);
 completarKev(filas, entradasKev);
 
-// Se filtra al final, con las filas ya enriquecidas: así el corte mira la fecha
-// de entrada en KEV, que la pone completarKev(). Lo que salga de aquí es lo que
-// se publica y lo único de lo que Telegram llega a enterarse.
-const publicables = aplicarCorte(filas, ahora);
+// Se filtra al final, con las filas ya enriquecidas y en un solo sitio: lo que
+// salga de aquí es lo que se publica y lo único de lo que Telegram llega a
+// enterarse. Las dos cosas son la misma lista a propósito.
+const publicables = await filtrarNuevas(filas, ahora);
+const registro = await leerCache(registroVistas);
 
 const salida = {
   generado: new Date().toISOString(),
   ventanaDias: VENTANA_DIAS,
-  corte: CORTE || null, // desde cuándo se acumula, si se arrancó en frío
+  desdeCero: registro.sembrado ?? null, // cuándo se hizo la primera revisión
+  conocidas: Object.keys(registro.ids ?? {}).length, // lo que el feed ya ha visto
   modo: RAPIDO ? "rapido" : "completo",
   desde,
   hasta,
