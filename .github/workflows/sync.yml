@@ -72,6 +72,14 @@ jobs:
       # algún día la cuenta aterrizara en otro sitio, esto corta aquí en vez de
       # subir el feed a un directorio que nadie sirve, que es exactamente el
       # fallo mudo que traía el cron del hosting.
+      #
+      # Los timeouts van cortos y con reintentos a propósito. El login entra por
+      # el canal de control, pero cada listado y cada transferencia abre otro
+      # canal de datos aparte, y el FTP del hosting a veces no lo abre: de los
+      # primeros 59 runs, 5 murieron aquí en el "ls", nunca en el login. Con los
+      # valores por defecto un parpadeo se comía 4,5 minutos de espera y tumbaba
+      # la pasada; así se reintenta a los 5 s y solo falla si el hosting está
+      # caído de verdad, que es cuando el correo de fallo dice algo.
       - name: Comprobar la conexión FTP
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
@@ -81,7 +89,9 @@ jobs:
           lftp <<EOF
           set ftp:ssl-force true
           set ssl:verify-certificate no
-          set net:max-retries 2
+          set net:timeout 15
+          set net:max-retries 5
+          set net:reconnect-interval-base 5
           set cmd:fail-exit yes
           open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
           echo "--- directorio al entrar por FTP:"
@@ -109,7 +119,9 @@ jobs:
           lftp <<EOF || true
           set ftp:ssl-force true
           set ssl:verify-certificate no
-          set net:max-retries 3
+          set net:timeout 15
+          set net:max-retries 5
+          set net:reconnect-interval-base 5
           set xfer:clobber on
           open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
           mget -O public/data "data/cve_meta.json"
@@ -162,7 +174,9 @@ jobs:
           lftp <<EOF
           set ftp:ssl-force true
           set ssl:verify-certificate no
-          set net:max-retries 3
+          set net:timeout 15
+          set net:max-retries 5
+          set net:reconnect-interval-base 5
           set xfer:clobber on
           open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
           put public/data/cves.json     -o "data/cves.json.tmp"
