@@ -66,7 +66,11 @@ const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? "";
 const TG_UMBRAL = Number(process.env.TELEGRAM_UMBRAL ?? "7"); // solo filtra lo que cae en el respaldo
 
 const TG_MAX_MENSAJES = 12; // por sala y pasada; lo que sobre se avisa en la siguiente
-const TG_PAUSA_MS = 1200; // Telegram corta a ~1 mensaje/s por chat
+// El límite que manda no es el del chat sino el del grupo: unos 20 mensajes por
+// minuto. Con las seis salas montadas como temas de un mismo grupo, los 1,2 s de
+// antes iban a ~50/min contra ese tope y Telegram devolvía 429 (visto el
+// 2026-09-08 a las 04:35). 3,5 s deja el ritmo en ~17/min, por debajo del límite.
+const TG_PAUSA_MS = 3500;
 
 /**
  * Modo rápido: el listado de la EUVD, los títulos y CWE nuevos de cve.org y el

@@ -48,7 +48,11 @@ const NVD_MARGEN_DIAS  = 30;    // se pide más ventana de la necesaria; ver com
 
 const TG_API          = 'https://api.telegram.org/bot';
 const TG_MAX_MENSAJES = 12;       // avisos por sala y pasada; lo que sobre se manda en la siguiente
-const TG_PAUSA_US     = 1200000;  // Telegram corta a ~1 mensaje/s por chat
+// El límite que manda no es el del chat sino el del grupo: unos 20 mensajes por
+// minuto. Con las seis salas montadas como temas de un mismo grupo, los 1,2 s de
+// antes iban a ~50/min contra ese tope y Telegram devolvía 429. 3,5 s deja el
+// ritmo en ~17/min, por debajo del límite.
+const TG_PAUSA_US     = 3500000;
 
 // Opcional: exporta NVD_API_KEY en el cron y el límite sube de 5 a 50 peticiones/30 s.
 $nvd_clave = getenv('NVD_API_KEY') ?: '';

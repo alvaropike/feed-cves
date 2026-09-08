@@ -313,9 +313,11 @@ estado se reconstruye solo en la primera pasada, también sin avisar.
 
 ### El ritmo
 
-Como mucho salen `TG_MAX_MENSAJES` (12) avisos **por sala** y pasada, con una pausa de 1,2 s
-entre mensajes: Telegram corta sobre 1 mensaje por segundo y chat, y responde 429 si te
-pasas. El tope es por sala a propósito — un atasco en medias no debe retrasar el aviso de
+Como mucho salen `TG_MAX_MENSAJES` (12) avisos **por sala** y pasada, con una pausa de 3,5 s
+entre mensajes. Ojo con esa pausa: el límite que manda no es el del chat sino **el del
+grupo**, unos 20 mensajes por minuto, y con las salas montadas como temas de un mismo grupo
+todas comparten ese tope. A 1,2 s el sync iba a ~50/min y Telegram respondía 429; a 3,5 s se
+queda en ~17/min. El tope es por sala a propósito — un atasco en medias no debe retrasar el aviso de
 una crítica. Lo que no quepa **no se pierde ni se marca**, sale en la pasada siguiente. Si
 aun así llega un 429, el sync corta los envíos ahí y lo retoma en la siguiente.
 
