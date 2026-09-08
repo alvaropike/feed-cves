@@ -1,9 +1,10 @@
 # Feed de vulnerabilidades (EUVD)
 
 Tabla web con las CVE publicadas recientemente: CVE, nombre, fabricante, CWE, criticidad,
-EPSS y fecha. Fuentes: EU Vulnerability Database de ENISA para el listado, cve.org para el
-título oficial y las CWE de cada CVE, el NVD del NIST para la puntuación CVSS, FIRST para
-la EPSS y los catálogos CISA KEV / EU KEV para marcar lo que ya se está explotando.
+EPSS y fecha. Fuentes: EU Vulnerability Database de ENISA para el listado y la puntuación
+CVSS, cve.org para el título oficial y las CWE de cada CVE —con el NVD del NIST de
+respaldo para las CWE—, FIRST para la EPSS y los catálogos CISA KEV / EU KEV para marcar
+lo que ya se está explotando.
 Opcionalmente avisa por Telegram, con una sala por criticidad y otra para lo que ya se
 está explotando; ver más abajo.
 
@@ -29,7 +30,7 @@ public_html/
 ├── data/
 │   ├── cves.json       ← lo sube el workflow en cada pasada
 │   ├── cve_meta.json   ← caché de títulos y CWE de cve.org, también del workflow
-│   ├── scores_nvd.json ← caché de puntuaciones CVSS del NVD, ídem
+│   ├── cwes_nvd.json   ← caché de las CWE que añade el NVD, ídem
 │   └── epss.json       ← última EPSS conocida de FIRST, red por si la API cae
 └── .notificado.json    ← qué se ha avisado ya por Telegram; fuera de data/, que se publica
 ```
@@ -131,16 +132,17 @@ ventana de ~4.900 vulnerabilidades, con las cachés ya calientes:
 |---|---|---|
 | Listado de la EUVD (50 páginas) | 35 s | 35 s |
 | cve.org (solo las nuevas) | 1 s | 1 s |
-| CVSS del NVD | **105 s** | de caché |
+| CWE del NVD | **105 s** | de caché |
 | EPSS de FIRST | 30 s | de caché |
 | KEV | 1 s | 1 s |
 | **Total** | **190 s** | **35 s** |
 
 La pasada rápida (`--rapido`, o `SYNC_RAPIDO=1`) baja el listado, los títulos y CWE de lo
-nuevo y el KEV, y lee de `scores_nvd.json` y `epss.json` en vez de preguntar. No se pierde
-nada: las filas ya enriquecidas conservan su CVSS y su EPSS, y las recién aparecidas los
-reciben en la siguiente pasada completa (hasta entonces salen como "Unscored" y "No data",
-que es lo que ya hacían).
+nuevo y el KEV, y lee de `cwes_nvd.json` y `epss.json` en vez de preguntar. No se pierde
+nada: la puntuación viene en el propio listado de la EUVD, así que siempre está al día; las
+filas ya enriquecidas conservan sus CWE y su EPSS, y las recién aparecidas las reciben en
+la siguiente pasada completa (hasta entonces la EPSS sale como "No data", que es lo que ya
+hacía).
 
 Merece la pena porque **el modelo EPSS se recalcula una vez al día** y el NVD tarda en
 enriquecer: pedirlos cada quince minutos es bajar los mismos números. Lo único que trae
@@ -269,7 +271,7 @@ EPSS: 86.8% (percentile 99)
 CWE: CWE-94, CWE-78
 Published: 2026-08-26
 
-NVD · CVE Record
+EUVD · CVE Record
 ```
 
 **Los mensajes van en inglés.** Es el idioma de las fuentes —el título sale de cve.org, las
@@ -281,10 +283,14 @@ enlaces. La cabecera va primera porque es lo único que se lee en la notificaci�
 y el identificador va en monoespaciada para poder copiarlo de un toque, que es lo primero
 que se hace con un CVE.
 
-Cada dato se calla si no lo hay, que es mejor que una fila con un guion: el CVSS es el del
-NVD y, si todavía no lo ha analizado, sale un `Score: EUVD, pending NVD analysis`; la EPSS
+Cada dato se calla si no lo hay, que es mejor que una fila con un guion: la EPSS
 solo aparece si FIRST ya tiene dato —lo recién publicado no lo tiene, y un 0 sería mentir—;
-el producto solo si difiere del fabricante; y los enlaces, solo si la fila tiene CVE.
+el producto solo si difiere del fabricante; el CVSS solo si la EUVD lo ha puesto, que si no
+la cabecera se queda en `Unscored`; y el enlace a cve.org, solo si la fila tiene CVE.
+
+**El primer enlace es la ficha de la EUVD**, que es de donde sale el CVSS del mensaje. Antes
+iba al NVD, pero mandar a una ficha que puntuaba otra cosa —o que sigue en "Awaiting
+Analysis"— era justo lo que hacía dudar del número.
 
 Las **CWE van enlazadas a cwe.mitre.org**, con el mismo tope de tres visibles y el mismo
 `+n` que la tabla: en la pantalla de un móvil, seis identificadores seguidos ocupan más que
@@ -301,26 +307,55 @@ Y cuando cve.org no tiene título —una de cada cuatro filas—, `nombre` es el
 la propia descripción. En ese caso el mensaje **no repite la frase**: se queda solo con la
 descripción, que además viene entera.
 
-### Cuando algo escala de sala
+### Cuando una CVE cambia después de avisada
 
-Una CVE que se avisó como alta y tres días después entra en KEV **se reavisa en la sala de
-KEV**, con una primera línea que lo dice:
+Los datos siguen moviéndose después del primer aviso: la EUVD ajusta la nota, FIRST recalcula
+la EPSS, CISA mete la CVE en su catálogo. El sync mantiene el mensaje al día, y lo que hace
+depende de si el cambio la saca o no de su sala.
+
+**Si se queda en la misma sala** —un 3.1 que pasa a 3.4— el mensaje **se edita en el sitio**.
+Telegram no notifica las ediciones de un bot, así que el mensaje se pone al día sin sonar,
+sin moverse del tema y sin duplicarse. Al pie queda la hora, que si no el mensaje cambiaría
+sin que se note:
 
 ```
-⬆️ Escalated — previously reported as High on 2026-09-04
+Updated 2026-09-08 10:12 UTC
+```
+
+**Si cambia de sala**, el mensaje **se muda**: se publica en la sala nueva y se borra el de la
+vieja. Un mensaje no se puede mover de un tema a otro, así que mudarse es la única forma de
+que cada sala siga significando lo que dice. El mensaje nuevo abre diciendo de dónde viene:
+
+```
+⬆️ Escalated — previously reported as Low on 2026-09-04
+⬇️ Downgraded — previously reported as Critical on 2026-09-04
 ```
 
 Eso es lo que convierte la sala de KEV en algo útil: la mitad de lo que entra ahí son CVE de
 las que ya se avisó hace días, y sin esa línea parecerían recién publicadas.
 
-Solo se reavisa **hacia arriba** —a KEV, o de altas a críticas si el NVD sube la nota—.
-Que el NVD rebaje una puntuación no genera mensaje: revisa notas a menudo y sería ruido.
+Las mudanzas van **en los dos sentidos**. Que la EUVD rebaje un 9.8 a un 5.0 no es una
+noticia, pero dejar ese mensaje en la sala de críticas sí es un problema. Primero se publica
+y luego se borra: si algo falla, es mejor un mensaje mal colocado que ninguno.
+
+Para borrar mensajes de más de 48 horas el bot tiene que ser **administrador del grupo con
+permiso de borrado**. Sin ese permiso las mudanzas dejan el mensaje viejo donde estaba y el
+sync lo dice en el log.
+
+**La EPSS se mira por bandas** —1 %, 10 % y 50 %—, no por decimales. El modelo de FIRST se
+recalcula a diario y casi ninguna CVE conserva el mismo número de un día para otro: sin
+bandas habría que reeditar las ~5.000 filas de la ventana todos los días, muy por encima de
+lo que Telegram admite. El mensaje enseña el número exacto del día en que se editó.
+
+Lo que sale de la ventana de 14 días deja de mantenerse: su último mensaje se queda
+publicado tal cual.
 
 ### Nuevo no es reciente
 
 Lo que decide si algo se avisa no es la fecha, es `.notificado.json`: un fichero con los
-identificadores EUVD y **a qué sala fue cada uno**, junto al script y fuera de `data/`, que
-es un directorio que se publica.
+identificadores EUVD y, de cada uno, **a qué sala fue, con qué identificador de mensaje y con
+qué firma** —un resumen de los campos que importan, que es lo que dice si hay que reeditar—,
+junto al script y fuera de `data/`, que es un directorio que se publica.
 
 Tiene que ser así porque la ventana de 14 días se solapa entre pasadas y porque los datos
 llegan tarde: una CVE entra hoy sin CVSS, sale como "Sin puntuar" y recibe su 9.8 tres
@@ -332,6 +367,10 @@ Las filas cuya sala no está montada **se anotan igual, sin enviarse**. Por eso 
 añadas la sala de medias no te caen encima las 1.700 de la ventana: solo llega lo que
 aparezca a partir de entonces. Y si vienes de la versión de un solo chat, el fichero de
 estado se reconstruye solo en la primera pasada, también sin avisar.
+
+Las entradas anotadas antes de que se guardara el identificador de mensaje no se pueden ni
+editar ni mudar: se les apunta la firma, siguen contando para no reavisar, y en 14 días salen
+de la ventana solas. Lo que se publique a partir de ahí ya nace editable.
 
 ### El ritmo
 
@@ -345,6 +384,11 @@ aun así llega un 429, el sync corta los envíos ahí y lo retoma en la siguient
 
 La cola sale ordenada por sala y luego por puntuación, así que si un día hay atasco, lo que
 ya se está explotando va delante.
+
+Las ediciones y los borrados cuentan contra ese mismo tope del grupo, así que van por el
+mismo contador de pausas. Las ediciones tienen su propio tope, `TG_MAX_EDICIONES` (40 por
+pasada), y van al final: como no notifican a nadie, lo justo es que cedan el turno a los
+avisos cuando la pasada se queda corta.
 
 Los avisos van **después** de escribir `cves.json` a propósito: que Telegram no conteste no
 puede dejar la web sin actualizar. Todo lo que pasa —lo enviado por sala, lo encolado, los
@@ -363,11 +407,11 @@ En `euvd_sync.mjs` y `euvd_sync.php` (los nombres son equivalentes en ambos):
 - `PAUSA_US` / `PAUSA_MS` — pausa entre peticiones. No lo bajes de 0,3 s.
 - `CONCURRENCIA_TITULOS` — peticiones simultáneas a cve.org. 6 va sobrado; subirlo
   arriesga que te empiecen a devolver 429.
-- `NVD_MARGEN_DIAS` — días extra de margen al pedir puntuaciones al NVD (ver más abajo).
+- `NVD_MARGEN_DIAS` — días extra de margen al pedir las CWE al NVD (ver más abajo).
 - `EPSS_TANDA` — CVE por petición a FIRST. 100 es el máximo que admite la API.
-- `NVD_API_KEY` — variable de entorno opcional. Sin ella el NVD deja 5 peticiones cada
-  30 s; con ella, 50. Se pide gratis en <https://nvd.nist.gov/developers/request-an-api-key>
-  Es el secreto `NVD_API_KEY` del repo.
+- `NVD_API_KEY` — variable de entorno opcional, solo para la descarga de CWE. Sin ella el
+  NVD deja 5 peticiones cada 30 s; con ella, 50. Se pide gratis en
+  <https://nvd.nist.gov/developers/request-an-api-key> Es el secreto `NVD_API_KEY` del repo.
 
 Con la ventana entera el JSON ronda los 6 MB, así que **sirve el `data/` con gzip**
 (`AddOutputFilterByType DEFLATE application/json` en el `.htaccess`); baja a ~1 MB. Si aun
@@ -395,25 +439,19 @@ CVE nuevas. Si borras `cve_meta.json`, se vuelve a construir entero. El antiguo
 
 ## De dónde sale la puntuación
 
-La CVSS que se muestra es la del **NVD** (`baseScore` de la métrica más moderna que tenga:
-v4.0, v3.1, v3.0 o v2, priorizando la primaria). La EUVD trae su propio `baseScore`, pero
-es el que le pasa el CNA y no siempre coincide con el análisis del NIST.
+La CVSS que se muestra es la de la **EUVD** (`baseScore`, con `baseScoreVersion` y
+`baseScoreVector`), que es la que le pasa el CNA y la que enseña la ficha que se enlaza.
+Viene en el propio listado, así que no cuesta ni una petición extra y está al día también
+en la pasada rápida.
 
-No se pide CVE a CVE: la API del NVD admite 5 peticiones cada 30 s sin clave, así que 2.500
-consultas serían horas. En vez de eso se baja **por rango de fechas de publicación**
-(`pubStartDate`/`pubEndDate`, 2.000 por página), que resuelve la ventana entera en unos
-segundos. El rango lleva `NVD_MARGEN_DIAS` de margen hacia atrás porque la fecha de
-publicación del NVD no tiene por qué coincidir con la de la EUVD.
+**Antes se pisaba con la del NVD y se dejó de hacer**: el NIST reanaliza por su cuenta y a
+veces no encajaba con la ficha de la EUVD —otra versión del CVSS, otro alcance—, así que
+una misma fila podía enseñar un número y su descripción contar otra cosa. Con una sola
+fuente, el score y el texto siempre hablan de lo mismo. El campo `origenScore` que decía
+de dónde venía cada nota ya no existe, ni en el JSON ni en la tabla.
 
-Cada fila lleva un campo `origenScore`:
-
-- `"nvd"` — puntuación del NVD. Es el caso normal (~90 % de las filas).
-- `"euvd"` — el NVD todavía no la ha analizado y se conserva la de la EUVD. La tabla lo
-  marca con una etiqueta `EUVD` pequeña junto al número.
-- `null` — nadie la ha puntuado: sale como "Sin puntuar".
-
-Las puntuaciones se cachean en `data/scores_nvd.json` igual que los títulos, así que si el
-NVD se cae o devuelve 503, la tabla sigue enseñando la última puntuación conocida.
+La EUVD manda `baseScore: 0` cuando no hay CVSS: eso se trata como hueco, no como un cero,
+y la fila sale como "Sin puntuar".
 
 ## De dónde salen las CWE
 
@@ -423,9 +461,17 @@ gravedad. Sale de `containers.cna.problemTypes` del registro de cve.org, que se 
 misma llamada que el título, así que no cuesta ni una petición extra. También se leen los
 contenedores ADP, que es donde CISA y los enriquecedores meten las suyas.
 
-Cuando cve.org no trae ninguna, se cae al `weaknesses` del NVD, que ya viene en la misma
-descarga por rango de fechas de las puntuaciones. Ahí solo está el identificador, sin el
-nombre, así que la fila enseña "CWE-89" a secas.
+Cuando cve.org no trae ninguna, se cae al `weaknesses` del NVD. Ahí solo está el
+identificador, sin el nombre, así que la fila enseña "CWE-89" a secas.
+
+Esa parte no se pide CVE a CVE: la API del NVD admite 5 peticiones cada 30 s sin clave, así
+que 2.500 consultas serían horas. En vez de eso se baja **por rango de fechas de
+publicación** (`pubStartDate`/`pubEndDate`, 2.000 por página), que resuelve la ventana
+entera en unos segundos. El rango lleva `NVD_MARGEN_DIAS` de margen hacia atrás porque la
+fecha de publicación del NVD no tiene por qué coincidir con la de la EUVD, y lo bajado se
+cachea en `data/cwes_nvd.json` igual que los títulos: si el NVD se cae o devuelve 503, la
+tabla sigue enseñando las últimas CWE conocidas. Es la fase más lenta del sync, y por eso
+la pasada rápida la lee de caché.
 
 Cada CWE se guarda como `{ id, nombre }` en `cwes[]`. Se descarta lo que no lleva número
 —`n/a`, `Other`, `NVD-CWE-noinfo`—: un hueco es más honesto que una etiqueta vacía.
@@ -519,9 +565,10 @@ reserva huecos por escalón.
   En ese caso la tabla enseña el ID EUVD en la columna CVE.
 - **El enlace apunta al NVD** (`https://nvd.nist.gov/vuln/detail/CVE-…`). Ojo: desde abril
   de 2026 muchas CVE se quedan sin enriquecer en el NVD, así que alguna ficha puede salir
-  con datos escasos o en estado "Awaiting Analysis" — son justo las que se quedan con la
-  puntuación de la EUVD. La alternativa es cve.org
-  (`https://www.cve.org/CVERecord?id=CVE-…`). Se cambia en `normalizar()`.
+  con datos escasos o en estado "Awaiting Analysis" — de ahí que tampoco se le pida ya la
+  puntuación. La alternativa es cve.org
+  (`https://www.cve.org/CVERecord?id=CVE-…`). Se cambia en `normalizar()`. Los avisos de
+  Telegram sí enlazan la ficha de la EUVD, que es la que enseña el CVSS del mensaje.
 - **Endpoints alternativos** por si más adelante quieres otras vistas:
   `/api/criticalvulnerabilities`, `/api/exploitedvulnerabilities` y `/api/kev/dump`
   (CISA KEV + EU KEV consolidados, actualizado a diario a las 07:00 UTC).

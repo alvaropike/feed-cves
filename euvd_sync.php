@@ -41,13 +41,19 @@ const API_EPSS      = 'https://api.first.org/data/v1/epss';  // probabilidad de 
 const EPSS_TANDA    = 100;     // máximo de CVE que admite una petición a FIRST
 const EPSS_PAUSA_US = 300000;
 
+// Del NVD solo se sacan las CWE. La puntuación se dejó de coger: el NIST
+// reanaliza por su cuenta y a veces no encajaba con la ficha de la EUVD —otra
+// versión del CVSS, otro alcance—, así que el score tiene una sola fuente.
 const API_NVD          = 'https://services.nvd.nist.gov/rest/json/cves/2.0';
 const NVD_PAGE         = 2000;  // máximo que admite la API del NVD
 const NVD_MAX_PAGINAS  = 15;    // tope de seguridad: 15 * 2.000 = 30.000 CVE
-const NVD_MARGEN_DIAS  = 30;    // se pide más ventana de la necesaria; ver completar_scores()
+const NVD_MARGEN_DIAS  = 30;    // se pide más ventana de la necesaria; ver completar_cwes_nvd()
 
 const TG_API          = 'https://api.telegram.org/bot';
 const TG_MAX_MENSAJES = 12;       // avisos por sala y pasada; lo que sobre se manda en la siguiente
+// Las ediciones son silenciosas, así que pueden esperar: este tope existe solo
+// para que una tanda de puestas al día no se coma la pasada entera.
+const TG_MAX_EDICIONES = 40;      // ediciones por pasada, sumando todas las salas
 // El límite que manda no es el del chat sino el del grupo: unos 20 mensajes por
 // minuto. Con las seis salas montadas como temas de un mismo grupo, los 1,2 s de
 // antes iban a ~50/min contra ese tope y Telegram devolvía 429. 3,5 s deja el
@@ -83,7 +89,7 @@ $tg_umbral = (float) (getenv('TELEGRAM_UMBRAL') ?: '7');  // solo filtra lo que 
 
 /**
  * Modo rápido: el listado de la EUVD, los títulos y CWE nuevos de cve.org y el
- * KEV; el CVSS del NVD y la EPSS se leen de la caché en vez de pedirse.
+ * KEV; las CWE del NVD y la EPSS se leen de la caché en vez de pedirse.
  *
  * Tiene sentido porque las fuentes no cambian al mismo ritmo: el modelo EPSS se
  * recalcula una vez al día y el NVD tarda en enriquecer, mientras que lo único
@@ -95,7 +101,7 @@ $rapido = in_array('--rapido', $argv ?? [], true) || getenv('SYNC_RAPIDO') === '
 $destino = __DIR__ . '/data/cves.json';
 $cerrojo_ruta = __DIR__ . '/.sync.lock';
 $cache_meta   = __DIR__ . '/data/cve_meta.json';   // título y CWE de cve.org
-$cache_scores = __DIR__ . '/data/scores_nvd.json';
+$cache_cwes   = __DIR__ . '/data/cwes_nvd.json';
 $cache_epss   = __DIR__ . '/data/epss.json';
 // Fuera de data/: ese directorio se publica y esto es estado interno, no un dato del feed.
 $estado_telegram = __DIR__ . '/.notificado.json';
@@ -420,39 +426,7 @@ function completar_meta(array &$filas, string $cache_ruta): void
     log_linea($con_titulo . ' de ' . count($filas) . ' filas con título de cve.org, ' . $con_cwe . ' con CWE');
 }
 
-// ---------------------------------------------------------------- CVSS y CWE del NVD
-
-/**
- * Del bloque `metrics` del NVD saca la métrica CVSS más moderna disponible,
- * prefiriendo la primaria (la del propio NIST o del CNA) sobre las secundarias.
- *
- * @return array{score:float,cvss:?string,vector:?string}|null
- */
-function metrica_nvd(?array $metrics): ?array
-{
-    foreach (['cvssMetricV40', 'cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2'] as $clave) {
-        $lista = $metrics[$clave] ?? null;
-        if (!is_array($lista) || $lista === []) continue;
-
-        $elegida = $lista[0];
-        foreach ($lista as $m) {
-            if (($m['type'] ?? null) === 'Primary') {
-                $elegida = $m;
-                break;
-            }
-        }
-
-        $datos = $elegida['cvssData'] ?? null;
-        if (!isset($datos['baseScore'])) continue;
-
-        return [
-            'score'  => (float) $datos['baseScore'],
-            'cvss'   => $datos['version'] ?? null,
-            'vector' => $datos['vectorString'] ?? null,
-        ];
-    }
-    return null;  // CVE recibida pero sin analizar todavía ("Awaiting Analysis")
-}
+// ---------------------------------------------------------------- CWE del NVD
 
 /**
  * Las CWE que el NVD asigna a una CVE. Vienen sin nombre, solo el identificador.
@@ -471,11 +445,11 @@ function cwes_de_nvd(?array $weaknesses): array
 }
 
 /**
- * Baja del NVD todas las CVE publicadas en un rango de fechas, paginando.
+ * Baja del NVD las CWE de todas las CVE publicadas en un rango de fechas, paginando.
  *
- * @return array<string,array{score?:float,cvss?:?string,vector?:?string,cwes:array<int,array{id:string,nombre:?string}>}>
+ * @return array<string,array<int,array{id:string,nombre:?string}>>
  */
-function pedir_scores_nvd(string $desde_iso, string $hasta_iso, string $clave, int $pausa_us): array
+function pedir_cwes_nvd(string $desde_iso, string $hasta_iso, string $clave, int $pausa_us): array
 {
     $cabeceras = $clave !== '' ? ['apiKey: ' . $clave] : [];
     $salida    = [];
@@ -490,7 +464,7 @@ function pedir_scores_nvd(string $desde_iso, string $hasta_iso, string $clave, i
 
         $respuesta = pedir($url, $cabeceras);
         if ($respuesta === null) {
-            log_linea('El NVD falló; me quedo con las puntuaciones que ya tenga.');
+            log_linea('El NVD falló; me quedo con las CWE que ya tenga.');
             break;
         }
 
@@ -503,18 +477,14 @@ function pedir_scores_nvd(string $desde_iso, string $hasta_iso, string $clave, i
             $id = $entrada['cve']['id'] ?? null;
             if (!is_string($id)) continue;
 
-            $metrica = metrica_nvd($entrada['cve']['metrics'] ?? null);
-            $cwes    = cwes_de_nvd($entrada['cve']['weaknesses'] ?? null);
-
-            // Guardamos la entrada aunque solo traiga CWE: el NVD tarda en puntuar,
-            // pero la debilidad suele venir desde el primer momento.
-            if ($metrica !== null || $cwes !== []) {
-                $salida[$id] = ($metrica ?? []) + ['cwes' => $cwes];
+            $cwes = cwes_de_nvd($entrada['cve']['weaknesses'] ?? null);
+            if ($cwes !== []) {
+                $salida[$id] = $cwes;
             }
         }
 
         $total = (int) ($respuesta['totalResults'] ?? 0);
-        log_linea('NVD página ' . $pagina . ': ' . count($vulns) . ' CVE (con CVSS acumuladas: ' . count($salida) . ')');
+        log_linea('NVD página ' . $pagina . ': ' . count($vulns) . ' CVE (con CWE acumuladas: ' . count($salida) . ')');
 
         if (($pagina + 1) * NVD_PAGE >= $total) {
             break;
@@ -526,18 +496,22 @@ function pedir_scores_nvd(string $desde_iso, string $hasta_iso, string $clave, i
 }
 
 /**
- * Sustituye la puntuación de la EUVD por la del NVD cuando esta existe.
+ * Completa con el NVD las CWE que cve.org no haya dado.
+ *
+ * La puntuación no se toca: el CVSS sale siempre de la EUVD. Antes se pisaba con
+ * el del NVD y a veces no encajaba —el NIST reanaliza por su cuenta, con otra
+ * versión del CVSS o sobre otro alcance—, y la fila acababa enseñando un número
+ * que no era el de la ficha que describe.
  *
  * Se pide por rango de fechas en vez de CVE a CVE porque la API del NVD admite
  * 5 peticiones cada 30 s sin clave (50 con `NVD_API_KEY`): así son ~9 páginas para
  * la ventana entera, mientras que ir uno por uno serían horas. El rango va con
  * NVD_MARGEN_DIAS de margen hacia atrás porque la fecha de publicación en el NVD
- * no tiene por qué coincidir con la de la EUVD. Lo que aun así se quede fuera
- * conserva la puntuación de la EUVD, marcada en `origenScore`.
+ * no tiene por qué coincidir con la de la EUVD.
  *
  * @param array<int,array<string,mixed>> $filas
  */
-function completar_scores(array &$filas, string $cache_ruta, string $clave, int $pausa_us, bool $rapido): void
+function completar_cwes_nvd(array &$filas, string $cache_ruta, string $clave, int $pausa_us, bool $rapido): void
 {
     $cache = leer_cache($cache_ruta);
 
@@ -547,37 +521,27 @@ function completar_scores(array &$filas, string $cache_ruta, string $clave, int 
     // En modo rápido no se pregunta al NVD: es la fase más lenta con diferencia y
     // el enriquecimiento no va a cambiar en quince minutos.
     // Lo recién bajado manda sobre la caché.
-    $scores = $rapido
+    $por_cve = $rapido
         ? $cache
-        : pedir_scores_nvd($desde_iso, $hasta_iso, $clave, $pausa_us) + $cache;
+        : pedir_cwes_nvd($desde_iso, $hasta_iso, $clave, $pausa_us) + $cache;
 
     $vigentes = [];
     $con_nvd  = 0;
     foreach ($filas as &$fila) {
-        $cve = $fila['cve'];
-        $nvd = is_string($cve) ? ($scores[$cve] ?? null) : null;
-        if ($nvd === null) continue;
+        $cve  = $fila['cve'];
+        $cwes = is_string($cve) ? ($por_cve[$cve] ?? null) : null;
+        if ($cwes === null || $cwes === []) continue;
 
-        if (isset($nvd['score'])) {
-            $fila['score']       = $nvd['score'];
-            $fila['severidad']   = severidad($nvd['score']);
-            $fila['cvss']        = $nvd['cvss'] ?? $fila['cvss'];
-            $fila['vector']      = $nvd['vector'] ?? $fila['vector'];
-            $fila['origenScore'] = 'nvd';
-            $con_nvd++;
-        }
         // El NVD solo completa las CWE que cve.org no haya dado: allí vienen con nombre.
-        if (($nvd['cwes'] ?? []) !== []) {
-            $fila['cwes'] = fusionar_cwes($fila['cwes'], $nvd['cwes']);
-        }
-
-        $vigentes[$cve] = $nvd;
+        $fila['cwes']   = fusionar_cwes($fila['cwes'], $cwes);
+        $vigentes[$cve] = $cwes;
+        $con_nvd++;
     }
     unset($fila);
 
     // Igual que con los títulos: la caché se queda solo con lo que sigue en ventana.
     escribir_json($cache_ruta, $vigentes);
-    log_linea($con_nvd . ' de ' . count($filas) . ' filas con CVSS del NVD'
+    log_linea($con_nvd . ' de ' . count($filas) . ' filas con CWE del NVD'
         . ($rapido ? ' (de caché)' : ''));
 }
 
@@ -764,14 +728,13 @@ function normalizar(array $item): ?array
         'vendors'     => $vendors,
         'producto'    => $productos[0] ?? null,
         'productos'   => $productos,
+        // La EUVD manda 0 cuando no hay CVSS: eso no es una puntuación, es un hueco,
+        // y severidad() lo deja en "sin_puntuar". Es la única fuente del score.
         'score'       => $score,
         'severidad'   => severidad($score),
-        // La EUVD manda 0 cuando no hay CVSS: eso no es una puntuación, es un hueco.
-        // Lo pisa completar_scores() si el NVD tiene puntuación para esta CVE.
-        'origenScore' => ($score !== null && $score > 0.0) ? 'euvd' : null,
         'cvss'        => $item['baseScoreVersion'] ?? null,
         'vector'      => $item['baseScoreVector'] ?? null,
-        'cwes'        => [],  // lo rellenan completar_meta() y completar_scores()
+        'cwes'        => [],  // lo rellenan completar_meta() y completar_cwes_nvd()
         'kev'         => null,  // lo rellena completar_kev()
         'epss'        => $con_epss ? $epss_euvd / 100 : null,
         'epssPercentil' => null,  // solo lo da FIRST
@@ -789,9 +752,10 @@ function normalizar(array $item): ?array
 // ---------------------------------------------------------------- Telegram
 
 /**
- * Las salas, de menos a más prioridad. Este orden decide dos cosas: a qué sala
- * va una fila que encaja en varias —KEV manda sobre la puntuación— y qué cuenta
- * como escalar, porque solo se reavisa hacia arriba.
+ * Las salas, de menos a más prioridad. Este orden decide a qué sala va una fila
+ * que encaja en varias —KEV manda sobre la puntuación— y, cuando una fila cambia
+ * de sala, si la mudanza es hacia arriba o hacia abajo, que es lo único que
+ * distingue el encabezado de un mensaje del otro.
  */
 const TG_ORDEN = ['sin_puntuar', 'baja', 'media', 'alta', 'critica', 'kev'];
 
@@ -810,6 +774,70 @@ function prioridad_sala(string $sala): int
 function sala_de(array $fila): string
 {
     return is_array($fila['kev']) ? 'kev' : (string) $fila['severidad'];
+}
+
+// Las bandas de EPSS que cuentan como cambio. El modelo de FIRST se recalcula a
+// diario y casi ninguna CVE conserva el mismo decimal de un día para otro: sin
+// bandas habría que reeditar la ventana entera cada día, que son miles de
+// llamadas contra un límite de veinte por minuto. Cruzar el 1, el 10 o el 50 %
+// cambia lo que uno hace con una vulnerabilidad; el tercer decimal no.
+const TG_BANDAS_EPSS = [0.01, 0.1, 0.5];
+
+function banda_epss(mixed $v): int
+{
+    if (!is_int($v) && !is_float($v)) {
+        return -1;
+    }
+
+    $n = 0;
+    foreach (TG_BANDAS_EPSS as $banda) {
+        if ((float) $v >= $banda) {
+            $n++;
+        }
+    }
+
+    return $n;
+}
+
+/**
+ * Lo que decide si un mensaje ya publicado se queda como está. Va aparte del
+ * texto a propósito: el texto lleva la EPSS con un decimal y la firma la lleva
+ * por bandas, así que el mensaje enseña el número exacto del día en que se editó
+ * pero un vaivén del 0,08 al 0,09 % no dispara una edición.
+ *
+ * SHA-1 sobre UTF-8 y en este orden exacto porque euvd_sync.mjs calcula la misma
+ * firma: así el estado se puede pasar de una implementación a la otra sin que se
+ * dispare una tanda de ediciones.
+ *
+ * @param array<string,mixed> $fila
+ */
+function firma_fila(array $fila, string $sala): string
+{
+    $cwes = [];
+    foreach (($fila['cwes'] ?? []) as $c) {
+        $cwes[] = (string) ($c['id'] ?? '');
+    }
+
+    $kev = '';
+    if (is_array($fila['kev'] ?? null)) {
+        $kev = (string) ($fila['kev']['fecha'] ?? '')
+            . '|' . implode(',', $fila['kev']['fuentes'] ?? []);
+    }
+
+    $partes = [
+        $sala,
+        (string) ($fila['score'] ?? ''),
+        (string) banda_epss($fila['epss'] ?? null),
+        $kev,
+        implode(',', $cwes),
+        (string) ($fila['nombre'] ?? ''),
+        (string) ($fila['descripcion'] ?? ''),
+        (string) ($fila['vendor'] ?? ''),
+        (string) ($fila['producto'] ?? ''),
+        (string) ($fila['fecha'] ?? ''),
+    ];
+
+    return substr(sha1(implode("\u{0001}", $partes)), 0, 10);
 }
 
 /**
@@ -893,14 +921,18 @@ const TG_CWE_VISIBLES  = 3;  // el mismo tope que la tabla; el resto va como "+n
  * El identificador va en <code> para que Telegram lo ponga en monoespaciada y
  * se pueda copiar tocándolo, que es lo primero que se hace con un CVE.
  *
- * $previa solo llega cuando es un reaviso por escalada, y entonces el mensaje
- * abre diciéndolo: en la sala de KEV, la mitad de los mensajes son CVE de las
- * que ya se avisó hace días, y sin ese aviso parecen recién publicadas.
+ * $previa solo llega cuando el mensaje se muda de sala, y entonces abre
+ * diciéndolo: en la sala de KEV, la mitad de los mensajes son CVE de las que ya
+ * se avisó hace días, y sin ese aviso parecen recién publicadas.
+ *
+ * $actualizado solo llega en las ediciones, y deja constancia de la hora. Sin eso
+ * un mensaje cambiaría de contenido sin que se note: Telegram no marca de ninguna
+ * manera los mensajes que edita un bot.
  *
  * @param array<string,mixed>      $fila
  * @param array<string,mixed>|null $previa
  */
-function mensaje_telegram(array $fila, ?array $previa = null): string
+function mensaje_telegram(array $fila, ?array $previa = null, ?string $actualizado = null): string
 {
     $marcas = [
         'critica'     => "\u{1F534} CRITICAL",
@@ -916,12 +948,20 @@ function mensaje_telegram(array $fila, ?array $previa = null): string
         $sala_previa = (string) ($previa['sala'] ?? '');
         $antes  = TG_ETIQUETA_SALA[$sala_previa] ?? $sala_previa;
         $cuando = is_string($previa['fecha'] ?? null) ? ' on ' . substr($previa['fecha'], 0, 10) : '';
-        $lineas[] = "\u{2B06}\u{FE0F} <b>Escalated</b> — previously reported as " . $antes . $cuando;
+        // El mensaje de la sala anterior se borra al mudarse, así que este encabezado
+        // no compite con nada: es lo único que queda de que ya se había avisado.
+        $sube  = prioridad_sala(sala_de($fila)) > prioridad_sala($sala_previa);
+        $marca = $sube
+            ? "\u{2B06}\u{FE0F} <b>Escalated</b>"
+            : "\u{2B07}\u{FE0F} <b>Downgraded</b>";
+        $lineas[] = $marca . ' — previously reported as ' . $antes . $cuando;
         $lineas[] = '';
     }
 
     $marca      = $marcas[$fila['severidad']] ?? $marcas['sin_puntuar'];
-    $puntuacion = $fila['score'] !== null
+    // El 0 de la EUVD es un hueco, no una puntuación: la cabecera se queda con la
+    // marca de "Unscored" a secas, sin un CVSS 0.0 que nadie ha puesto.
+    $puntuacion = ($fila['score'] !== null && $fila['score'] > 0.0)
         ? ' · CVSS <b>' . number_format((float) $fila['score'], 1, '.', '') . '</b>'
         : '';
     $lineas[] = $marca . $puntuacion . ' · <code>' . escapar_html($fila['cve'] ?? $fila['euvd']) . '</code>';
@@ -999,9 +1039,6 @@ function mensaje_telegram(array $fila, ?array $previa = null): string
         $datos[] = '<b>CWE:</b> ' . implode(', ', $enlazadas) . ($resto > 0 ? ' +' . $resto : '');
     }
 
-    if ($fila['origenScore'] === 'euvd') {
-        $datos[] = '<b>Score:</b> EUVD, pending NVD analysis';
-    }
     if (is_string($fila['fecha'])) {
         $datos[] = '<b>Published:</b> ' . substr($fila['fecha'], 0, 10);
     }
@@ -1011,42 +1048,39 @@ function mensaje_telegram(array $fila, ?array $previa = null): string
         $lineas   = array_merge($lineas, $datos);
     }
 
-    $enlaces = [];
-    if (is_string($fila['enlace'])) {
-        $enlaces[] = '<a href="' . escapar_html($fila['enlace']) . '">NVD</a>';
-    }
+    // El primer enlace es la ficha de la EUVD, que es de donde sale el CVSS del
+    // mensaje. Antes iba al NVD, y mandar a una ficha que puntuaba otra cosa —o que
+    // sigue en "Awaiting Analysis"— era justo lo que hacía dudar del número.
+    $enlaces = [
+        '<a href="https://euvd.enisa.europa.eu/vulnerability/'
+            . escapar_html($fila['euvd']) . '">EUVD</a>',
+    ];
     if (is_string($fila['cve'])) {
         $enlaces[] = '<a href="https://www.cve.org/CVERecord?id=' . escapar_html($fila['cve']) . '">CVE Record</a>';
     }
-    if (count($enlaces) > 0) {
+    $lineas[] = '';
+    $lineas[] = implode(' · ', $enlaces);
+
+    if ($actualizado !== null) {
         $lineas[] = '';
-        $lineas[] = implode(' · ', $enlaces);
+        $lineas[] = '<i>Updated ' . str_replace('T', ' ', substr($actualizado, 0, 16)) . ' UTC</i>';
     }
 
     return implode("\n", $lineas);
 }
 
 /**
- * Manda un mensaje. Devuelve si se envió y, cuando Telegram pide esperar (429),
- * cuántos segundos.
+ * Una sola puerta a la API. Envíos, ediciones y borrados cuentan todos contra el
+ * mismo límite del grupo, así que conviene tratarlos igual y devolver siempre la
+ * espera que pida un 429 y el motivo, que es lo que distingue un fallo de verdad
+ * de un "ese mensaje ya no existe".
  *
- * @return array{enviado: bool, esperar: int}
+ * @param array<string,mixed> $cuerpo
+ * @return array{ok: bool, esperar: int, resultado: mixed, motivo: string}
  */
-function telegram_enviar(string $token, string $destino, string $texto): array
+function telegram_llamar(string $token, string $metodo, array $cuerpo): array
 {
-    ['chat' => $chat, 'hilo' => $hilo] = partir_destino($destino);
-
-    $cuerpo = [
-        'chat_id'                  => $chat,
-        'text'                     => $texto,
-        'parse_mode'               => 'HTML',
-        'disable_web_page_preview' => true,
-    ];
-    if ($hilo !== null) {
-        $cuerpo['message_thread_id'] = $hilo;
-    }
-
-    $ch = curl_init(TG_API . $token . '/sendMessage');
+    $ch = curl_init(TG_API . $token . '/' . $metodo);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST           => true,
@@ -1062,34 +1096,136 @@ function telegram_enviar(string $token, string $destino, string $texto): array
     curl_close($ch);
 
     if ($respuesta === false) {
-        log_linea("Telegram: cURL falló: {$error}");
-        return ['enviado' => false, 'esperar' => 0];
+        log_linea("Telegram: {$metodo} falló: {$error}");
+        return ['ok' => false, 'esperar' => 0, 'resultado' => null, 'motivo' => $error];
     }
 
     $json = json_decode((string) $respuesta, true);
     if ($codigo === 200 && ($json['ok'] ?? false) === true) {
-        return ['enviado' => true, 'esperar' => 0];
+        return ['ok' => true, 'esperar' => 0, 'resultado' => $json['result'] ?? null, 'motivo' => ''];
     }
 
-    log_linea("Telegram: HTTP {$codigo} en {$destino} " . ($json['description'] ?? ''));
-    return ['enviado' => false, 'esperar' => (int) ($json['parameters']['retry_after'] ?? 0)];
+    $motivo = (string) ($json['description'] ?? "HTTP {$codigo}");
+    log_linea("Telegram: {$metodo} falló — {$motivo}");
+
+    return [
+        'ok'        => false,
+        'esperar'   => (int) ($json['parameters']['retry_after'] ?? 0),
+        'resultado' => null,
+        'motivo'    => $motivo,
+    ];
 }
 
 /**
- * Avisa por Telegram, cada vulnerabilidad a la sala que le toca.
+ * Devuelve dónde quedó el mensaje —chat e identificador— porque sin eso no se
+ * puede ni editar ni borrar después, y cuánto esperar si Telegram corta (429).
  *
- * Lo que decide si algo se avisa no es la fecha sino .notificado.json, donde
- * queda a qué sala fue cada una. La ventana se solapa entre pasadas y los datos
- * llegan tarde —una CVE entra sin CVSS y recibe un 9.8 tres pasadas después—,
- * así que filtrar por fecha se dejaría justo lo que más importa.
+ * @return array{enviado: bool, esperar: int, chat: string, mensaje: int|null}
+ */
+function telegram_enviar(string $token, string $destino, string $texto): array
+{
+    ['chat' => $chat, 'hilo' => $hilo] = partir_destino($destino);
+
+    $cuerpo = [
+        'chat_id'                  => $chat,
+        'text'                     => $texto,
+        'parse_mode'               => 'HTML',
+        'disable_web_page_preview' => true,
+    ];
+    if ($hilo !== null) {
+        $cuerpo['message_thread_id'] = $hilo;
+    }
+
+    $r       = telegram_llamar($token, 'sendMessage', $cuerpo);
+    $mensaje = $r['resultado']['message_id'] ?? null;
+
+    return [
+        'enviado' => $r['ok'],
+        'esperar' => $r['esperar'],
+        'chat'    => $chat,
+        'mensaje' => $mensaje === null ? null : (int) $mensaje,
+    ];
+}
+
+/**
+ * Pone al día un mensaje sin sacarlo de su tema y sin notificar a nadie: es lo
+ * que se quiere cuando una CVE cambia pero se queda en la misma sala.
  *
- * Y por eso mismo se reavisa cuando algo escala de sala: una que se avisó como
- * alta y hoy consta en KEV es una noticia, no un duplicado. Solo hacia arriba;
- * que el NVD rebaje una nota no merece un mensaje.
+ * "message is not modified" cuenta como hecha —el texto ya es el que toca, y
+ * reintentarlo cada pasada sería pelearse con Telegram para siempre—, y "not
+ * found" también, porque es un mensaje borrado a mano: quien llama se entera por
+ * `perdido` y tira el identificador en vez de reintentar eternamente.
+ *
+ * @return array{hecha: bool, esperar: int, perdido: bool}
+ */
+function telegram_editar(string $token, string $chat, int $mensaje, string $texto): array
+{
+    $r = telegram_llamar($token, 'editMessageText', [
+        'chat_id'                  => $chat,
+        'message_id'               => $mensaje,
+        'text'                     => $texto,
+        'parse_mode'               => 'HTML',
+        'disable_web_page_preview' => true,
+    ]);
+
+    if ($r['ok'] || stripos($r['motivo'], 'not modified') !== false) {
+        return ['hecha' => true, 'esperar' => 0, 'perdido' => false];
+    }
+
+    $perdido = stripos($r['motivo'], 'not found') !== false;
+
+    return ['hecha' => $perdido, 'esperar' => $r['esperar'], 'perdido' => $perdido];
+}
+
+/**
+ * Borra el mensaje de la sala que ha dejado de corresponder. El bot es
+ * administrador del grupo con permiso de borrado, así que no le aplica el tope de
+ * 48 horas de los mensajes normales: dentro de la ventana de 14 días se puede
+ * borrar cualquiera. Si algún día se le quita el permiso, esto empieza a fallar y
+ * los mensajes viejos se quedan donde están; se ve en el log.
+ *
+ * @return array{hecho: bool, esperar: int}
+ */
+function telegram_borrar(string $token, string $chat, int $mensaje): array
+{
+    $r = telegram_llamar($token, 'deleteMessage', ['chat_id' => $chat, 'message_id' => $mensaje]);
+
+    if ($r['ok'] || stripos($r['motivo'], 'not found') !== false) {
+        return ['hecho' => true, 'esperar' => 0];
+    }
+
+    return ['hecho' => false, 'esperar' => $r['esperar']];
+}
+
+/**
+ * Avisa por Telegram y mantiene al día lo ya avisado.
+ *
+ * Lo que decide qué hacer con cada fila no es la fecha sino .notificado.json,
+ * donde queda a qué sala fue cada una, con qué identificador de mensaje y con qué
+ * firma. La ventana se solapa entre pasadas y los datos llegan tarde —una CVE
+ * entra sin CVSS y recibe un 9.8 tres pasadas después—, así que filtrar por fecha
+ * dejaría fuera justo lo que más importa.
+ *
+ * Con eso, tres caminos:
+ *
+ *   - Sin mensaje previo: se envía, como siempre.
+ *   - Misma sala y firma distinta: se edita en el sitio. Telegram no notifica las
+ *     ediciones de un bot, así que el mensaje se pone al día sin sonar y sin
+ *     moverse del tema, que es lo que se quiere para un 3.1 que pasa a 3.4.
+ *   - Otra sala: el tema es la clasificación, así que el mensaje se muda. Se
+ *     publica en la sala nueva y se borra el de la vieja, en ese orden: si algo
+ *     falla, preferimos un mensaje mal colocado a ninguno.
+ *
+ * Las mudanzas van en los dos sentidos. Que la EUVD rebaje un 9.8 a un 5.0 no es
+ * una noticia, pero dejar ese mensaje en la sala de críticas sí es un problema:
+ * la sala dejaría de querer decir lo que dice.
+ *
+ * Lo que sale de la ventana deja de mantenerse y su último mensaje se queda
+ * publicado tal cual: la alternativa era guardar el estado para siempre.
  *
  * Las filas sin sala configurada se anotan igual, sin enviar. Así, el día que
- * montes la sala de medias, no te caen encima las 1.700 de la ventana: solo
- * llega lo que aparezca a partir de entonces.
+ * montes la sala de medias, no te caen encima las 1.700 de la ventana: solo llega
+ * lo que aparezca a partir de entonces.
  *
  * La primera ejecución no manda nada: siembra el fichero con lo que ya hay.
  *
@@ -1113,7 +1249,12 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
 
     // El formato viejo guardaba `euvd: fecha` en vez de `euvd: {sala, fecha}`. Se
     // reconstruye entero y sin avisar, como una siembra: reaprovecharlo mandaría un
-    // reaviso de escalada por cada fila que antes no tenía sala anotada.
+    // reaviso por cada fila que antes no tenía sala anotada.
+    //
+    // Las entradas sin `mensaje` —las escritas antes de que se guardara el
+    // identificador— no son ni editables ni movibles, pero eso no rompe nada: se
+    // les anota la firma, siguen contando para no reavisar, y en 14 días salen de la
+    // ventana solas.
     $formato_viejo = false;
     foreach ($previas as $entrada) {
         if (!is_array($entrada)) {
@@ -1136,7 +1277,13 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
 
     if ($primera_vez || $formato_viejo) {
         foreach ($filas as $fila) {
-            $vigentes[$fila['euvd']] = ['sala' => sala_de($fila), 'fecha' => $ahora, 'enviada' => false];
+            $sala = sala_de($fila);
+            $vigentes[$fila['euvd']] = [
+                'sala'    => $sala,
+                'fecha'   => $ahora,
+                'enviada' => false,
+                'firma'   => firma_fila($fila, $sala),
+            ];
         }
         escribir_json($estado_ruta, [
             'sembrado' => is_string($estado['sembrado'] ?? null) ? $estado['sembrado'] : $ahora,
@@ -1148,74 +1295,186 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
         return;
     }
 
-    // Nuevas y escaladas. Las que no tengan sala montada se anotan aquí mismo y no
-    // vuelven a mirarse mientras no suban de sala.
-    $candidatas = [];
+    $envios    = [];  // primer aviso y mudanzas: los dos acaban en un sendMessage
+    $ediciones = [];  // misma sala, contenido distinto
 
     foreach ($filas as $fila) {
-        $sala   = sala_de($fila);
-        $previa = $vigentes[$fila['euvd']] ?? null;
-
-        if ($previa !== null && prioridad_sala($sala) <= prioridad_sala((string) $previa['sala'])) {
-            continue;
-        }
-
+        $sala    = sala_de($fila);
+        $previa  = $vigentes[$fila['euvd']] ?? null;
+        $firma   = firma_fila($fila, $sala);
         $destino = destino_de($sala, $fila, $salas, $respaldo, $umbral);
-        if ($destino === '') {
-            $vigentes[$fila['euvd']] = ['sala' => $sala, 'fecha' => $ahora, 'enviada' => false];
+
+        // Ya anotada y sigue en su sala: como mucho, una edición silenciosa.
+        if ($previa !== null && (string) ($previa['sala'] ?? '') === $sala) {
+            if (($previa['firma'] ?? null) === $firma) {
+                continue;
+            }
+            if (($previa['enviada'] ?? false) && ($previa['mensaje'] ?? null) !== null) {
+                $ediciones[] = ['fila' => $fila, 'sala' => $sala, 'previa' => $previa, 'firma' => $firma];
+            } else {
+                $previa['firma'] = $firma;
+                $vigentes[$fila['euvd']] = $previa;
+            }
             continue;
         }
 
-        $candidatas[] = [
-            'fila'    => $fila,
-            'sala'    => $sala,
-            'destino' => $destino,
-            'previa'  => ($previa !== null && ($previa['enviada'] ?? false)) ? $previa : null,
+        // Sin sala montada: se anota y no se vuelve a mirar mientras no cambie de
+        // sala. Si venía publicada de otra, se borra: allí ya no pinta nada.
+        if ($destino === '') {
+            if (($previa['mensaje'] ?? null) !== null) {
+                $envios[] = [
+                    'fila' => $fila, 'sala' => $sala, 'destino' => '',
+                    'previa' => $previa, 'firma' => $firma, 'solo_borrar' => true,
+                ];
+            } else {
+                $vigentes[$fila['euvd']] = [
+                    'sala' => $sala, 'fecha' => $ahora, 'enviada' => false, 'firma' => $firma,
+                ];
+            }
+            continue;
+        }
+
+        $envios[] = [
+            'fila' => $fila, 'sala' => $sala, 'destino' => $destino,
+            'previa' => $previa, 'firma' => $firma, 'solo_borrar' => false,
         ];
     }
 
-    if (count($candidatas) === 0) {
-        log_linea('Telegram: nada nuevo que avisar.');
+    if (count($envios) === 0 && count($ediciones) === 0) {
+        log_linea('Telegram: nada nuevo que avisar ni que actualizar.');
         escribir_json($estado_ruta, ['sembrado' => $estado['sembrado'], 'avisadas' => $vigentes]);
         return;
     }
 
     // Por sala y luego por puntuación: si un día hay atasco, lo que ya se está
     // explotando sale delante.
-    usort($candidatas, static function (array $a, array $b): int {
+    usort($envios, static function (array $a, array $b): int {
         return (prioridad_sala($b['sala']) <=> prioridad_sala($a['sala']))
             ?: ((float) ($b['fila']['score'] ?? 0) <=> (float) ($a['fila']['score'] ?? 0));
     });
 
-    $enviadas = [];
-    $total    = 0;
-    $cortado  = false;
-
-    foreach ($candidatas as $c) {
-        // El tope es por sala: el límite de Telegram es por chat, así que un atasco
-        // en medias no tiene por qué retrasar el aviso de una crítica.
-        $cupo = ($enviadas[$c['sala']] ?? 0) + 1;
-        if ($cupo > TG_MAX_MENSAJES) {
-            continue;  // se queda sin marcar: sale en la siguiente pasada
-        }
-
-        if ($total > 0) {
+    // Envíos, ediciones y borrados van todos contra el mismo límite del grupo, así
+    // que la pausa la lleva un único contador y no cada bucle por su cuenta.
+    $llamadas = 0;
+    $ritmo = static function () use (&$llamadas): void {
+        if ($llamadas > 0) {
             usleep(TG_PAUSA_US);
         }
+        $llamadas++;
+    };
 
-        $resultado = telegram_enviar($token, $c['destino'], mensaje_telegram($c['fila'], $c['previa']));
+    $enviadas = [];
+    $total    = 0;
+    $hechos   = 0;
+    $mudadas  = 0;
+    $editadas = 0;
+    $cortado  = false;
 
-        if ($resultado['enviado']) {
-            $vigentes[$c['fila']['euvd']] = ['sala' => $c['sala'], 'fecha' => $ahora, 'enviada' => true];
-            $enviadas[$c['sala']] = $cupo;
+    foreach ($envios as $e) {
+        // El tope es por sala: el límite de Telegram es por chat, así que un atasco en
+        // medias no tiene por qué retrasar el aviso de una crítica.
+        $cupo = ($enviadas[$e['sala']] ?? 0) + 1;
+        if (!$e['solo_borrar'] && $cupo > TG_MAX_MENSAJES) {
+            continue;  // sin marcar: sale en la siguiente pasada
+        }
+
+        $previa = $e['previa'];
+        $apunte = ['sala' => $e['sala'], 'fecha' => $ahora, 'enviada' => false, 'firma' => $e['firma']];
+
+        if (!$e['solo_borrar']) {
+            // El encabezado de mudanza solo tiene sentido si de la anterior se llegó a
+            // avisar; si no, para quien lo lee es un mensaje nuevo y punto.
+            $ritmo();
+            $texto = mensaje_telegram(
+                $e['fila'],
+                ($previa !== null && ($previa['enviada'] ?? false)) ? $previa : null
+            );
+            $r = telegram_enviar($token, $e['destino'], $texto);
+
+            if (!$r['enviado']) {
+                // 429: Telegram dice cuánto callar. Cortamos y lo retomamos en la pasada
+                // siguiente; lo no enviado se queda sin marcar, así que no se pierde.
+                if ($r['esperar'] > 0) {
+                    log_linea('Telegram: me pide esperar ' . $r['esperar']
+                        . ' s; lo dejo para la siguiente pasada.');
+                    $cortado = true;
+                    break;
+                }
+                continue;  // sin marcar: se reintenta en la siguiente pasada
+            }
+
+            $apunte = [
+                'sala'    => $e['sala'],
+                'fecha'   => $ahora,
+                'enviada' => true,
+                'chat'    => $r['chat'],
+                'mensaje' => $r['mensaje'],
+                'firma'   => $e['firma'],
+            ];
+            $enviadas[$e['sala']] = $cupo;
             $total++;
-        } elseif ($resultado['esperar'] > 0) {
-            // 429: Telegram dice cuánto callar. Cortamos y lo retomamos en la pasada
-            // siguiente; lo no enviado se queda sin marcar, así que no se pierde.
-            log_linea('Telegram: me pide esperar ' . $resultado['esperar']
-                . ' s; lo dejo para la siguiente pasada.');
-            $cortado = true;
-            break;
+        }
+
+        // Y ahora el viejo, que ya no corresponde a esta sala. Va después del envío a
+        // propósito: si falla el borrado queda un duplicado, pero si fallara al revés
+        // nos quedaríamos sin aviso.
+        if (($previa['mensaje'] ?? null) !== null && ($previa['chat'] ?? '') !== '') {
+            $ritmo();
+            $b = telegram_borrar($token, (string) $previa['chat'], (int) $previa['mensaje']);
+            if ($b['hecho']) {
+                $mudadas++;
+            } else {
+                log_linea('Telegram: no pude borrar el mensaje de ' . $e['fila']['euvd']
+                    . ' en la sala ' . (string) ($previa['sala'] ?? '?') . '.');
+            }
+        }
+
+        $vigentes[$e['fila']['euvd']] = $apunte;
+        $hechos++;
+    }
+
+    // Las ediciones, al final: no notifican a nadie, así que si la pasada se queda
+    // sin tiempo o sin cupo, lo justo es que cedan el turno a los avisos.
+    if (!$cortado) {
+        foreach ($ediciones as $ed) {
+            if ($editadas >= TG_MAX_EDICIONES) {
+                break;  // el resto, en la siguiente pasada
+            }
+
+            $previa = $ed['previa'];
+            $ritmo();
+            $r = telegram_editar(
+                $token,
+                (string) $previa['chat'],
+                (int) $previa['mensaje'],
+                mensaje_telegram($ed['fila'], null, $ahora)
+            );
+
+            if (!$r['hecha']) {
+                if ($r['esperar'] > 0) {
+                    log_linea('Telegram: me pide esperar ' . $r['esperar']
+                        . ' s; dejo las ediciones para la siguiente pasada.');
+                    $cortado = true;
+                    break;
+                }
+                continue;
+            }
+
+            // Si el mensaje ya no existe se olvida el identificador y la fila vuelve a
+            // contar como anotada pero no publicada: no se reenvía —eso sería avisar dos
+            // veces de lo mismo— pero tampoco se reintenta editar cada pasada.
+            if ($r['perdido']) {
+                $vigentes[$ed['fila']['euvd']] = [
+                    'sala'    => $ed['sala'],
+                    'fecha'   => $previa['fecha'],
+                    'enviada' => false,
+                    'firma'   => $ed['firma'],
+                ];
+            } else {
+                $previa['firma'] = $ed['firma'];
+                $vigentes[$ed['fila']['euvd']] = $previa;
+            }
+            $editadas++;
         }
     }
 
@@ -1225,10 +1484,12 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
     foreach ($enviadas as $sala => $n) {
         $desglose[] = $sala . ' ' . $n;
     }
-    $cola = count($candidatas) - $total;
+    $cola = (count($envios) - $hechos) + (count($ediciones) - $editadas);
 
     log_linea('Telegram: ' . $total . ' avisos enviados'
         . (count($desglose) > 0 ? ' (' . implode(', ', $desglose) . ')' : '')
+        . ($mudadas > 0 ? ', ' . $mudadas . ' movidos de sala' : '')
+        . ($editadas > 0 ? ', ' . $editadas . ' actualizados en el sitio' : '')
         . ($cola > 0 ? ', ' . $cola . ' para la siguiente pasada' . ($cortado ? ' (me cortaron)' : '') : ''));
 }
 
@@ -1319,7 +1580,7 @@ usort($filas, static function (array $a, array $b): int {
 });
 
 completar_meta($filas, $cache_meta);
-completar_scores($filas, $cache_scores, $nvd_clave, $nvd_pausa_us, $rapido);
+completar_cwes_nvd($filas, $cache_cwes, $nvd_clave, $nvd_pausa_us, $rapido);
 completar_epss($filas, $cache_epss, $rapido);
 completar_kev($filas);
 
@@ -1332,7 +1593,7 @@ $salida = [
     'total'         => count($filas),
     'totalEnEuvd'   => $total_api,
     'fuente'        => 'EU Vulnerability Database (ENISA)',
-    'fuenteScore'   => 'NVD (NIST), con la EUVD de respaldo',
+    'fuenteScore'   => 'EU Vulnerability Database (ENISA)',
     'fuenteEpss'    => 'EPSS de FIRST',
     'fuenteKev'     => 'CISA KEV y EU KEV, vía EUVD',
     'fuenteCwe'     => 'cve.org, con el NVD de respaldo',

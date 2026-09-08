@@ -112,7 +112,7 @@ jobs:
           set xfer:clobber on
           open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
           mget -O public/data "data/cve_meta.json"
-          mget -O public/data "data/scores_nvd.json"
+          mget -O public/data "data/cwes_nvd.json"
           mget -O public/data "data/epss.json"
           get .notificado.json -o .notificado.json
           bye
@@ -163,12 +163,12 @@ jobs:
           set net:max-retries 3
           set xfer:clobber on
           open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
-          put public/data/cves.json      -o "data/cves.json.tmp"
+          put public/data/cves.json     -o "data/cves.json.tmp"
           mv "data/cves.json.tmp" "data/cves.json"
-          put public/data/cve_meta.json   -o "data/cve_meta.json"
-          put public/data/scores_nvd.json -o "data/scores_nvd.json"
-          put public/data/epss.json       -o "data/epss.json"
-          put .notificado.json            -o .notificado.json
+          put public/data/cve_meta.json -o "data/cve_meta.json"
+          put public/data/cwes_nvd.json -o "data/cwes_nvd.json"
+          put public/data/epss.json     -o "data/epss.json"
+          put .notificado.json          -o .notificado.json
           bye
           EOF
 

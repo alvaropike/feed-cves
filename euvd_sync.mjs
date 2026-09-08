@@ -14,6 +14,7 @@
 
 import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -36,11 +37,14 @@ const API_EPSS = "https://api.first.org/data/v1/epss"; // probabilidad de explot
 const EPSS_TANDA = 100; // máximo de CVE que admite una petición a FIRST
 const EPSS_PAUSA_MS = 300;
 
+// Del NVD solo se sacan las CWE. La puntuación se dejó de coger: el NIST
+// reanaliza por su cuenta y a veces no encajaba con la ficha de la EUVD —otra
+// versión del CVSS, otro alcance—, así que el score tiene una sola fuente.
 const API_NVD = "https://services.nvd.nist.gov/rest/json/cves/2.0";
 const NVD_CLAVE = process.env.NVD_API_KEY ?? ""; // opcional: sube el límite a 50 peticiones/30 s
 const NVD_PAGE = 2000; // máximo que admite la API del NVD
 const NVD_MAX_PAGINAS = 15; // tope de seguridad: 15 * 2.000 = 30.000 CVE
-const NVD_MARGEN_DIAS = 30; // se pide más ventana de la necesaria; ver completarScores()
+const NVD_MARGEN_DIAS = 30; // se pide más ventana de la necesaria; ver completarCwesNvd()
 const NVD_PAUSA_MS = NVD_CLAVE ? 1000 : 6500; // sin clave: 5 peticiones cada 30 s
 
 // ---- Telegram. Sin token ni ningún chat, el sync corre igual y no avisa.
@@ -66,6 +70,10 @@ const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? "";
 const TG_UMBRAL = Number(process.env.TELEGRAM_UMBRAL ?? "7"); // solo filtra lo que cae en el respaldo
 
 const TG_MAX_MENSAJES = 12; // por sala y pasada; lo que sobre se avisa en la siguiente
+// Las ediciones son silenciosas, así que pueden esperar: este tope existe solo
+// para que una tanda de puestas al día no se coma la pasada entera a 3,5 s cada
+// una. Lo que no entre se edita en la siguiente.
+const TG_MAX_EDICIONES = 40; // por pasada, sumando todas las salas
 // El límite que manda no es el del chat sino el del grupo: unos 20 mensajes por
 // minuto. Con las seis salas montadas como temas de un mismo grupo, los 1,2 s de
 // antes iban a ~50/min contra ese tope y Telegram devolvía 429 (visto el
@@ -74,7 +82,7 @@ const TG_PAUSA_MS = 3500;
 
 /**
  * Modo rápido: el listado de la EUVD, los títulos y CWE nuevos de cve.org y el
- * KEV; el CVSS del NVD y la EPSS se leen de la caché en vez de pedirse.
+ * KEV; las CWE del NVD y la EPSS se leen de la caché en vez de pedirse.
  *
  * Tiene sentido porque las fuentes no cambian al mismo ritmo: el modelo EPSS se
  * recalcula una vez al día y el NVD tarda en enriquecer, mientras que lo único
@@ -89,7 +97,7 @@ const AQUI = dirname(fileURLToPath(import.meta.url));
 const cerrojoRuta = join(AQUI, ".sync.lock");
 const destino = join(AQUI, "public", "data", "cves.json");
 const cacheMeta = join(AQUI, "public", "data", "cve_meta.json"); // título y CWE de cve.org
-const cacheScores = join(AQUI, "public", "data", "scores_nvd.json");
+const cacheCwes = join(AQUI, "public", "data", "cwes_nvd.json");
 const cacheEpss = join(AQUI, "public", "data", "epss.json");
 // Fuera de data/: ese directorio se publica y esto es estado interno, no un dato del feed.
 const estadoTelegram = join(AQUI, ".notificado.json");
@@ -305,31 +313,9 @@ async function completarMeta(filas) {
   log(`${conTitulo} de ${filas.length} filas con título de cve.org, ${conCwe} con CWE`);
 }
 
-// ---------------------------------------------------------------- CVSS y CWE del NVD
+// ---------------------------------------------------------------- CWE del NVD
 
 const fechaNvd = (d) => d.toISOString().slice(0, 19) + ".000";
-
-/**
- * Del bloque `metrics` del NVD saca la métrica CVSS más moderna disponible,
- * prefiriendo la primaria (la del propio NIST o del CNA) sobre las secundarias.
- */
-function metricaNvd(metrics) {
-  for (const clave of ["cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"]) {
-    const lista = metrics?.[clave];
-    if (!Array.isArray(lista) || lista.length === 0) continue;
-
-    const elegida = lista.find((m) => m?.type === "Primary") ?? lista[0];
-    const datos = elegida?.cvssData;
-    if (datos?.baseScore == null) continue;
-
-    return {
-      score: Number(datos.baseScore),
-      cvss: datos.version ?? null,
-      vector: datos.vectorString ?? null,
-    };
-  }
-  return null; // CVE recibida pero sin analizar todavía ("Awaiting Analysis")
-}
 
 /** Las CWE que el NVD asigna a una CVE. Vienen sin nombre, solo el identificador. */
 function cwesDeNvd(weaknesses) {
@@ -343,10 +329,10 @@ function cwesDeNvd(weaknesses) {
 }
 
 /**
- * Baja del NVD todas las CVE publicadas en un rango de fechas, paginando.
- * @returns {Promise<Record<string, {score:number|null,cvss:string|null,vector:string|null,cwes:{id:string,nombre:string|null}[]}>>}
+ * Baja del NVD las CWE de todas las CVE publicadas en un rango de fechas, paginando.
+ * @returns {Promise<Record<string, {id:string,nombre:string|null}[]>>}
  */
-async function pedirScoresNvd(desdeIso, hastaIso) {
+async function pedirCwesNvd(desdeIso, hastaIso) {
   const cabeceras = NVD_CLAVE ? { apiKey: NVD_CLAVE } : {};
   const salida = {};
 
@@ -363,7 +349,7 @@ async function pedirScoresNvd(desdeIso, hastaIso) {
 
     const respuesta = await pedir(url, cabeceras);
     if (respuesta === null) {
-      log("El NVD falló; me quedo con las puntuaciones que ya tenga.");
+      log("El NVD falló; me quedo con las CWE que ya tenga.");
       break;
     }
 
@@ -374,15 +360,12 @@ async function pedirScoresNvd(desdeIso, hastaIso) {
       const id = entrada?.cve?.id;
       if (typeof id !== "string") continue;
 
-      const metrica = metricaNvd(entrada?.cve?.metrics);
       const cwes = cwesDeNvd(entrada?.cve?.weaknesses);
-      // Guardamos la entrada aunque solo traiga CWE: el NVD tarda en puntuar,
-      // pero la debilidad suele venir desde el primer momento.
-      if (metrica || cwes.length) salida[id] = { ...(metrica ?? {}), cwes };
+      if (cwes.length) salida[id] = cwes;
     }
 
     const total = respuesta.totalResults ?? 0;
-    log(`NVD página ${pagina}: ${vulns.length} CVE (con CVSS acumuladas: ${Object.keys(salida).length})`);
+    log(`NVD página ${pagina}: ${vulns.length} CVE (con CWE acumuladas: ${Object.keys(salida).length})`);
 
     if ((pagina + 1) * NVD_PAGE >= total) break;
     await dormir(NVD_PAUSA_MS);
@@ -392,48 +375,44 @@ async function pedirScoresNvd(desdeIso, hastaIso) {
 }
 
 /**
- * Sustituye la puntuación de la EUVD por la del NVD cuando esta existe.
+ * Completa con el NVD las CWE que cve.org no haya dado.
+ *
+ * La puntuación no se toca: el CVSS sale siempre de la EUVD. Antes se pisaba con
+ * el del NVD y a veces no encajaba —el NIST reanaliza por su cuenta, con otra
+ * versión del CVSS o sobre otro alcance—, y la fila acababa enseñando un número
+ * que no era el de la ficha que describe.
  *
  * Se pide por rango de fechas en vez de CVE a CVE porque la API del NVD admite
  * 5 peticiones cada 30 s sin clave (50 con `NVD_API_KEY`): así son ~9 páginas para
  * la ventana entera, mientras que ir uno por uno serían horas. El rango va con
  * NVD_MARGEN_DIAS de margen hacia atrás porque la fecha de publicación en el NVD
- * no tiene por qué coincidir con la de la EUVD. Lo que aun así se quede fuera
- * conserva la puntuación de la EUVD, marcada en `origenScore`.
+ * no tiene por qué coincidir con la de la EUVD.
  */
-async function completarScores(filas) {
+async function completarCwesNvd(filas) {
   const hasta = new Date();
   const desde = new Date(hasta.getTime() - (VENTANA_DIAS + NVD_MARGEN_DIAS) * 86400000);
 
-  const cache = await leerCache(cacheScores);
+  const cache = await leerCache(cacheCwes);
   // En modo rápido no se pregunta al NVD: es la fase más lenta con diferencia y
   // el enriquecimiento no va a cambiar en quince minutos.
-  const frescas = RAPIDO ? {} : await pedirScoresNvd(fechaNvd(desde), fechaNvd(hasta));
-  const scores = { ...cache, ...frescas }; // lo recién bajado manda sobre la caché
+  const frescas = RAPIDO ? {} : await pedirCwesNvd(fechaNvd(desde), fechaNvd(hasta));
+  const porCve = { ...cache, ...frescas }; // lo recién bajado manda sobre la caché
 
   const vigentes = {};
   let conNvd = 0;
   for (const fila of filas) {
-    const nvd = fila.cve ? scores[fila.cve] : null;
-    if (!nvd) continue;
+    const cwes = fila.cve ? porCve[fila.cve] : null;
+    if (!cwes?.length) continue;
 
-    if (nvd.score != null) {
-      fila.score = nvd.score;
-      fila.severidad = severidad(nvd.score);
-      fila.cvss = nvd.cvss ?? fila.cvss;
-      fila.vector = nvd.vector ?? fila.vector;
-      fila.origenScore = "nvd";
-      conNvd++;
-    }
     // El NVD solo completa las CWE que cve.org no haya dado: allí vienen con nombre.
-    if (nvd.cwes?.length) fila.cwes = fusionarCwes(fila.cwes, nvd.cwes);
-
-    vigentes[fila.cve] = nvd;
+    fila.cwes = fusionarCwes(fila.cwes, cwes);
+    vigentes[fila.cve] = cwes;
+    conNvd++;
   }
 
   // Igual que con los títulos: la caché se queda solo con lo que sigue en ventana.
-  await escribirJson(cacheScores, vigentes);
-  log(`${conNvd} de ${filas.length} filas con CVSS del NVD${RAPIDO ? " (de caché)" : ""}`);
+  await escribirJson(cacheCwes, vigentes);
+  log(`${conNvd} de ${filas.length} filas con CWE del NVD${RAPIDO ? " (de caché)" : ""}`);
 }
 
 // ---------------------------------------------------------------- EPSS de FIRST
@@ -584,13 +563,13 @@ function normalizar(item) {
     vendors,
     producto: productos[0] ?? null,
     productos,
+    // La EUVD manda 0 cuando no hay CVSS: eso no es una puntuación, es un hueco,
+    // y severidad() lo deja en "sin_puntuar". Es la única fuente del score.
     score,
     severidad: severidad(score),
-    // La EUVD manda 0 cuando no hay CVSS: eso no es una puntuación, es un hueco.
-    origenScore: score != null && score > 0 ? "euvd" : null, // lo pisa completarScores()
     cvss: item.baseScoreVersion ?? null,
     vector: item.baseScoreVector ?? null,
-    cwes: [], // lo rellenan completarMeta() y completarScores()
+    cwes: [], // lo rellenan completarMeta() y completarCwesNvd()
     kev: null, // lo rellena completarKev()
     epss: epssEuvd != null && epssEuvd > 0 ? epssEuvd / 100 : null,
     epssPercentil: null, // solo lo da FIRST
@@ -606,9 +585,10 @@ function normalizar(item) {
 // ---------------------------------------------------------------- Telegram
 
 /**
- * Las salas, de menos a más prioridad. Este orden decide dos cosas: a qué sala
- * va una fila que encaja en varias —KEV manda sobre la puntuación— y qué cuenta
- * como escalar, porque solo se reavisa hacia arriba.
+ * Las salas, de menos a más prioridad. Este orden decide a qué sala va una fila
+ * que encaja en varias —KEV manda sobre la puntuación— y, cuando una fila cambia
+ * de sala, si la mudanza es hacia arriba o hacia abajo, que es lo único que
+ * distingue el encabezado de un mensaje del otro.
  */
 const TG_ORDEN = ["sin_puntuar", "baja", "media", "alta", "critica", "kev"];
 
@@ -617,6 +597,46 @@ const prioridadSala = (sala) => TG_ORDEN.indexOf(sala);
 
 /** Cada fila va a una sola sala: la de KEV si consta explotada, si no la de su severidad. */
 const salaDe = (fila) => (fila.kev ? "kev" : fila.severidad);
+
+// Las bandas de EPSS que cuentan como cambio. El modelo de FIRST se recalcula a
+// diario y casi ninguna CVE conserva el mismo decimal de un día para otro: sin
+// bandas habría que reeditar la ventana entera cada día, que son miles de
+// llamadas contra un límite de veinte por minuto. Cruzar el 1, el 10 o el 50 %
+// cambia lo que uno hace con una vulnerabilidad; el tercer decimal no.
+const TG_BANDAS_EPSS = [0.01, 0.1, 0.5];
+
+const bandaEpss = (v) => (typeof v === "number" ? TG_BANDAS_EPSS.filter((b) => v >= b).length : -1);
+
+/**
+ * Firma corta y estable; no hace falta resistencia a colisiones, hace falta que
+ * euvd_sync.php calcule exactamente la misma. Por eso SHA-1 sobre los bytes UTF-8
+ * y no algo hecho a mano: PHP recorre bytes y JavaScript unidades UTF-16, así que
+ * cualquier hash artesanal se separaría en cuanto hubiera un acento.
+ */
+const firmaCorta = (texto) => createHash("sha1").update(texto, "utf8").digest("hex").slice(0, 10);
+
+/**
+ * Lo que decide si un mensaje ya publicado se queda como está. Va aparte del
+ * texto a propósito: el texto lleva la EPSS con un decimal y la firma la lleva
+ * por bandas, así que el mensaje enseña el número exacto del día en que se editó
+ * pero un vaivén del 0,08 al 0,09 % no dispara una edición.
+ */
+function firmaFila(fila, sala) {
+  return firmaCorta(
+    [
+      sala,
+      fila.score ?? "",
+      bandaEpss(fila.epss),
+      fila.kev ? `${fila.kev.fecha ?? ""}|${(fila.kev.fuentes ?? []).join(",")}` : "",
+      (fila.cwes ?? []).map((c) => c?.id).join(","),
+      fila.nombre ?? "",
+      fila.descripcion ?? "",
+      fila.vendor ?? "",
+      fila.producto ?? "",
+      fila.fecha ?? "",
+    ].join("\u0001")
+  );
+}
 
 /**
  * El chat de una sala, con TELEGRAM_CHAT_ID de respaldo para las que no tengan
@@ -692,21 +712,33 @@ const TG_CWE_VISIBLES = 3; // el mismo tope que la tabla; el resto va como "+n"
  * El identificador va en <code> para que Telegram lo ponga en monoespaciada y
  * se pueda copiar tocándolo, que es lo primero que se hace con un CVE.
  *
- * `previa` solo llega cuando es un reaviso por escalada, y entonces el mensaje
- * abre diciéndolo: en la sala de KEV, la mitad de los mensajes son CVE de las
- * que ya se avisó hace días, y sin ese aviso parecen recién publicadas.
+ * `previa` solo llega cuando el mensaje se muda de sala, y entonces abre
+ * diciéndolo: en la sala de KEV, la mitad de los mensajes son CVE de las que ya
+ * se avisó hace días, y sin ese aviso parecen recién publicadas.
+ *
+ * `actualizado` solo llega en las ediciones, y deja constancia de la hora. Sin
+ * eso un mensaje cambiaría de contenido sin que se note: Telegram no marca de
+ * ninguna manera los mensajes que edita un bot.
  */
-function mensajeTelegram(fila, previa = null) {
+function mensajeTelegram(fila, previa = null, actualizado = null) {
   const lineas = [];
 
   if (previa) {
     const antes = TG_ETIQUETA_SALA[previa.sala] ?? previa.sala;
     const cuando = typeof previa.fecha === "string" ? ` on ${previa.fecha.slice(0, 10)}` : "";
-    lineas.push(`\u{2B06}\u{FE0F} <b>Escalated</b> — previously reported as ${antes}${cuando}`, "");
+    // El mensaje de la sala anterior se borra al mudarse, así que este encabezado
+    // no compite con nada: es lo único que queda de que ya se había avisado.
+    const sube = prioridadSala(salaDe(fila)) > prioridadSala(previa.sala);
+    const marca = sube
+      ? "\u{2B06}\u{FE0F} <b>Escalated</b>"
+      : "\u{2B07}\u{FE0F} <b>Downgraded</b>";
+    lineas.push(`${marca} — previously reported as ${antes}${cuando}`, "");
   }
 
   const marca = TG_MARCA[fila.severidad] ?? TG_MARCA.sin_puntuar;
-  const puntuacion = fila.score != null ? ` · CVSS <b>${fila.score.toFixed(1)}</b>` : "";
+  // El 0 de la EUVD es un hueco, no una puntuación: la cabecera se queda con la
+  // marca de "Unscored" a secas, sin un CVSS 0.0 que nadie ha puesto.
+  const puntuacion = fila.score > 0 ? ` · CVSS <b>${fila.score.toFixed(1)}</b>` : "";
   lineas.push(`${marca}${puntuacion} · <code>${escaparHtml(fila.cve ?? fila.euvd)}</code>`);
 
   // La descripción trae saltos de línea a media frase, así que se normaliza.
@@ -766,65 +798,139 @@ function mensajeTelegram(fila, previa = null) {
     datos.push(`<b>CWE:</b> ${enlazadas}${resto > 0 ? ` +${resto}` : ""}`);
   }
 
-  if (fila.origenScore === "euvd") datos.push("<b>Score:</b> EUVD, pending NVD analysis");
   if (fila.fecha) datos.push(`<b>Published:</b> ${fila.fecha.slice(0, 10)}`);
 
   if (datos.length) lineas.push("", ...datos);
 
-  const enlaces = [];
-  if (fila.enlace) enlaces.push(`<a href="${escaparHtml(fila.enlace)}">NVD</a>`);
+  // El primer enlace es la ficha de la EUVD, que es de donde sale el CVSS del
+  // mensaje. Antes iba al NVD, y mandar a una ficha que puntuaba otra cosa —o que
+  // sigue en "Awaiting Analysis"— era justo lo que hacía dudar del número.
+  const enlaces = [
+    `<a href="https://euvd.enisa.europa.eu/vulnerability/${escaparHtml(fila.euvd)}">EUVD</a>`,
+  ];
   if (fila.cve) {
     enlaces.push(`<a href="https://www.cve.org/CVERecord?id=${escaparHtml(fila.cve)}">CVE Record</a>`);
   }
-  if (enlaces.length) lineas.push("", enlaces.join(" · "));
+  lineas.push("", enlaces.join(" · "));
+
+  if (actualizado) lineas.push("", `<i>Updated ${actualizado.slice(0, 16).replace("T", " ")} UTC</i>`);
 
   return lineas.join("\n");
 }
 
-/** Devuelve si se envió y, cuando Telegram pide esperar (429), cuántos segundos. */
-async function telegramEnviar(destino, texto) {
-  const { chat, hilo } = partirDestino(destino);
-
+/**
+ * Una sola puerta a la API. Envíos, ediciones y borrados cuentan todos contra el
+ * mismo límite del grupo, así que conviene tratarlos igual y devolver siempre la
+ * espera que pida un 429 y el motivo, que es lo que distingue un fallo de verdad
+ * de un "ese mensaje ya no existe".
+ *
+ * @returns {Promise<{ok:boolean, esperar:number, resultado:any, motivo:string}>}
+ */
+async function telegramLlamar(metodo, cuerpo) {
   try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${metodo}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chat,
-        ...(hilo != null ? { message_thread_id: hilo } : {}),
-        text: texto,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-      }),
+      body: JSON.stringify(cuerpo),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
 
     const json = await r.json().catch(() => null);
-    if (r.ok && json?.ok === true) return { enviado: true, esperar: 0 };
+    if (r.ok && json?.ok === true) return { ok: true, esperar: 0, resultado: json.result, motivo: "" };
 
-    log(`Telegram: HTTP ${r.status} en ${destino} ${json?.description ?? ""}`.trimEnd());
-    return { enviado: false, esperar: Number(json?.parameters?.retry_after ?? 0) };
+    const motivo = String(json?.description ?? `HTTP ${r.status}`);
+    log(`Telegram: ${metodo} falló — ${motivo}`);
+    return { ok: false, esperar: Number(json?.parameters?.retry_after ?? 0), resultado: null, motivo };
   } catch (e) {
-    log(`Telegram: petición fallida (${e.message})`);
-    return { enviado: false, esperar: 0 };
+    log(`Telegram: ${metodo} falló (${e.message})`);
+    return { ok: false, esperar: 0, resultado: null, motivo: e.message };
   }
 }
 
 /**
- * Avisa por Telegram, cada vulnerabilidad a la sala que le toca.
+ * Devuelve dónde quedó el mensaje —chat e identificador— porque sin eso no se
+ * puede ni editar ni borrar después, y cuánto esperar si Telegram corta (429).
+ */
+async function telegramEnviar(destino, texto) {
+  const { chat, hilo } = partirDestino(destino);
+
+  const r = await telegramLlamar("sendMessage", {
+    chat_id: chat,
+    ...(hilo != null ? { message_thread_id: hilo } : {}),
+    text: texto,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  });
+
+  return { enviado: r.ok, esperar: r.esperar, chat, mensaje: r.resultado?.message_id ?? null };
+}
+
+/**
+ * Pone al día un mensaje sin sacarlo de su tema y sin notificar a nadie: es lo
+ * que se quiere cuando una CVE cambia pero se queda en la misma sala.
  *
- * Lo que decide si algo se avisa no es la fecha sino .notificado.json, donde
- * queda a qué sala fue cada una. La ventana se solapa entre pasadas y los datos
- * llegan tarde —una CVE entra sin CVSS y recibe un 9.8 tres pasadas después—,
- * así que filtrar por fecha se dejaría justo lo que más importa.
+ * "message is not modified" cuenta como hecha —el texto ya es el que toca, y
+ * reintentarlo cada pasada sería pelearse con Telegram para siempre—, y "not
+ * found" también, porque es un mensaje borrado a mano: quien llama se entera por
+ * `perdido` y tira el identificador en vez de reintentar eternamente.
+ */
+async function telegramEditar(chat, mensaje, texto) {
+  const r = await telegramLlamar("editMessageText", {
+    chat_id: chat,
+    message_id: mensaje,
+    text: texto,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  });
+
+  if (r.ok || /not modified/i.test(r.motivo)) return { hecha: true, esperar: 0, perdido: false };
+
+  const perdido = /not found/i.test(r.motivo);
+  return { hecha: perdido, esperar: r.esperar, perdido };
+}
+
+/**
+ * Borra el mensaje de la sala que ha dejado de corresponder. El bot es
+ * administrador del grupo con permiso de borrado, así que no le aplica el tope de
+ * 48 horas de los mensajes normales: dentro de la ventana de 14 días se puede
+ * borrar cualquiera. Si algún día se le quita el permiso, esto empieza a fallar y
+ * los mensajes viejos se quedan donde están; se ve en el log.
+ */
+async function telegramBorrar(chat, mensaje) {
+  const r = await telegramLlamar("deleteMessage", { chat_id: chat, message_id: mensaje });
+  if (r.ok || /not found/i.test(r.motivo)) return { hecho: true, esperar: 0 };
+  return { hecho: false, esperar: r.esperar };
+}
+
+/**
+ * Avisa por Telegram y mantiene al día lo ya avisado.
  *
- * Y por eso mismo se reavisa cuando algo escala de sala: una que se avisó como
- * alta y hoy consta en KEV es una noticia, no un duplicado. Solo hacia arriba;
- * que el NVD rebaje una nota no merece un mensaje.
+ * Lo que decide qué hacer con cada fila no es la fecha sino .notificado.json,
+ * donde queda a qué sala fue cada una, con qué identificador de mensaje y con qué
+ * firma. La ventana se solapa entre pasadas y los datos llegan tarde —una CVE
+ * entra sin CVSS y recibe un 9.8 tres pasadas después—, así que filtrar por fecha
+ * dejaría fuera justo lo que más importa.
+ *
+ * Con eso, tres caminos:
+ *
+ *   - Sin mensaje previo: se envía, como siempre.
+ *   - Misma sala y firma distinta: se edita en el sitio. Telegram no notifica las
+ *     ediciones de un bot, así que el mensaje se pone al día sin sonar y sin
+ *     moverse del tema, que es lo que se quiere para un 3.1 que pasa a 3.4.
+ *   - Otra sala: el tema es la clasificación, así que el mensaje se muda. Se
+ *     publica en la sala nueva y se borra el de la vieja, en ese orden: si algo
+ *     falla, preferimos un mensaje mal colocado a ninguno.
+ *
+ * Las mudanzas van en los dos sentidos. Que la EUVD rebaje un 9.8 a un 5.0 no es
+ * una noticia, pero dejar ese mensaje en la sala de críticas sí es un problema:
+ * la sala dejaría de querer decir lo que dice.
+ *
+ * Lo que sale de la ventana deja de mantenerse y su último mensaje se queda
+ * publicado tal cual: la alternativa era guardar el estado para siempre.
  *
  * Las filas sin sala configurada se anotan igual, sin enviar. Así, el día que
- * montes la sala de medias, no te caen encima las 1.700 de la ventana: solo
- * llega lo que aparezca a partir de entonces.
+ * montes la sala de medias, no te caen encima las 1.700 de la ventana: solo llega
+ * lo que aparezca a partir de entonces.
  *
  * La primera ejecución no manda nada: siembra el fichero con lo que ya hay.
  *
@@ -844,7 +950,12 @@ async function notificarTelegram(filas) {
 
   // El formato viejo guardaba `euvd: fecha` en vez de `euvd: {sala, fecha}`. Se
   // reconstruye entero y sin avisar, como una siembra: reaprovecharlo mandaría un
-  // reaviso de escalada por cada fila que antes no tenía sala anotada.
+  // reaviso por cada fila que antes no tenía sala anotada.
+  //
+  // Las entradas sin `mensaje` —las escritas antes de que se guardara el
+  // identificador— no son ni editables ni movibles, pero eso no rompe nada: se
+  // les anota la firma, siguen contando para no reavisar, y en 14 días salen de la
+  // ventana solas.
   const formatoViejo = Object.values(previas).some((v) => typeof v !== "object" || v === null);
   const primeraVez = typeof estado.sembrado !== "string";
 
@@ -857,7 +968,10 @@ async function notificarTelegram(filas) {
 
   if (primeraVez || formatoViejo) {
     const ahora = new Date().toISOString();
-    for (const fila of filas) vigentes[fila.euvd] = { sala: salaDe(fila), fecha: ahora, enviada: false };
+    for (const fila of filas) {
+      const sala = salaDe(fila);
+      vigentes[fila.euvd] = { sala, fecha: ahora, enviada: false, firma: firmaFila(fila, sala) };
+    }
 
     await escribirJson(estadoTelegram, { sembrado: estado.sembrado ?? ahora, avisadas: vigentes });
     log(
@@ -867,60 +981,136 @@ async function notificarTelegram(filas) {
     return;
   }
 
-  // Nuevas y escaladas. Las que no tengan sala montada se anotan aquí mismo y no
-  // vuelven a mirarse mientras no suban de sala.
   const ahora = new Date().toISOString();
-  const candidatas = [];
+  const envios = []; // primer aviso y mudanzas: los dos acaban en un sendMessage
+  const ediciones = []; // misma sala, contenido distinto
 
   for (const fila of filas) {
     const sala = salaDe(fila);
     const previa = vigentes[fila.euvd] ?? null;
-    if (previa && prioridadSala(sala) <= prioridadSala(previa.sala)) continue;
-
+    const firma = firmaFila(fila, sala);
     const destino = destinoDe(sala, fila);
-    if (!destino) {
-      vigentes[fila.euvd] = { sala, fecha: ahora, enviada: false };
+
+    // Ya anotada y sigue en su sala: como mucho, una edición silenciosa.
+    if (previa && previa.sala === sala) {
+      if (previa.firma === firma) continue;
+      if (previa.enviada && previa.mensaje) ediciones.push({ fila, sala, previa, firma });
+      else vigentes[fila.euvd] = { ...previa, firma };
       continue;
     }
 
-    candidatas.push({ fila, sala, destino, previa: previa?.enviada ? previa : null });
+    // Sin sala montada: se anota y no se vuelve a mirar mientras no cambie de
+    // sala. Si venía publicada de otra, se borra: allí ya no pinta nada.
+    if (!destino) {
+      if (previa?.mensaje) envios.push({ fila, sala, destino: "", previa, firma, soloBorrar: true });
+      else vigentes[fila.euvd] = { sala, fecha: ahora, enviada: false, firma };
+      continue;
+    }
+
+    envios.push({ fila, sala, destino, previa, firma, soloBorrar: false });
   }
 
-  if (candidatas.length === 0) {
-    log("Telegram: nada nuevo que avisar.");
+  if (envios.length === 0 && ediciones.length === 0) {
+    log("Telegram: nada nuevo que avisar ni que actualizar.");
     await escribirJson(estadoTelegram, { sembrado: estado.sembrado, avisadas: vigentes });
     return;
   }
 
   // Por sala y luego por puntuación: si un día hay atasco, lo que ya se está
   // explotando sale delante.
-  candidatas.sort(
+  envios.sort(
     (a, b) => prioridadSala(b.sala) - prioridadSala(a.sala) || (b.fila.score ?? 0) - (a.fila.score ?? 0)
   );
 
+  // Envíos, ediciones y borrados van todos contra el mismo límite del grupo, así
+  // que la pausa la lleva un único contador y no cada bucle por su cuenta.
+  let llamadas = 0;
+  const ritmo = async () => {
+    if (llamadas > 0) await dormir(TG_PAUSA_MS);
+    llamadas++;
+  };
+
   const enviadas = {};
   let total = 0;
+  let hechos = 0;
+  let mudadas = 0;
+  let editadas = 0;
   let cortado = false;
 
-  for (const { fila, sala, destino, previa } of candidatas) {
-    // El tope es por sala: el límite de Telegram es por chat, así que un atasco
-    // en medias no tiene por qué retrasar el aviso de una crítica.
+  for (const { fila, sala, destino, previa, firma, soloBorrar } of envios) {
+    // El tope es por sala: el límite de Telegram es por chat, así que un atasco en
+    // medias no tiene por qué retrasar el aviso de una crítica.
     const cupo = (enviadas[sala] ?? 0) + 1;
-    if (cupo > TG_MAX_MENSAJES) continue; // se queda sin marcar: sale en la siguiente pasada
+    if (!soloBorrar && cupo > TG_MAX_MENSAJES) continue; // sin marcar: sale en la siguiente pasada
 
-    if (total > 0) await dormir(TG_PAUSA_MS);
-    const { enviado, esperar } = await telegramEnviar(destino, mensajeTelegram(fila, previa));
+    let apunte = { sala, fecha: ahora, enviada: false, firma };
 
-    if (enviado) {
-      vigentes[fila.euvd] = { sala, fecha: ahora, enviada: true };
+    if (!soloBorrar) {
+      // El encabezado de mudanza solo tiene sentido si de la anterior se llegó a
+      // avisar; si no, para quien lo lee es un mensaje nuevo y punto.
+      await ritmo();
+      const texto = mensajeTelegram(fila, previa?.enviada ? previa : null);
+      const { enviado, esperar, chat, mensaje } = await telegramEnviar(destino, texto);
+
+      if (!enviado) {
+        // 429: Telegram dice cuánto callar. Cortamos y lo retomamos en la pasada
+        // siguiente; lo no enviado se queda sin marcar, así que no se pierde.
+        if (esperar > 0) {
+          log(`Telegram: me pide esperar ${esperar} s; lo dejo para la siguiente pasada.`);
+          cortado = true;
+          break;
+        }
+        continue; // sin marcar: se reintenta en la siguiente pasada
+      }
+
+      apunte = { sala, fecha: ahora, enviada: true, chat, mensaje, firma };
       enviadas[sala] = cupo;
       total++;
-    } else if (esperar > 0) {
-      // 429: Telegram dice cuánto callar. Cortamos y lo retomamos en la pasada
-      // siguiente; lo no enviado se queda sin marcar, así que no se pierde.
-      log(`Telegram: me pide esperar ${esperar} s; lo dejo para la siguiente pasada.`);
-      cortado = true;
-      break;
+    }
+
+    // Y ahora el viejo, que ya no corresponde a esta sala. Va después del envío a
+    // propósito: si falla el borrado queda un duplicado, pero si fallara al revés
+    // nos quedaríamos sin aviso.
+    if (previa?.mensaje && previa?.chat) {
+      await ritmo();
+      const { hecho } = await telegramBorrar(previa.chat, previa.mensaje);
+      if (hecho) mudadas++;
+      else log(`Telegram: no pude borrar el mensaje de ${fila.euvd} en la sala ${previa.sala}.`);
+    }
+
+    vigentes[fila.euvd] = apunte;
+    hechos++;
+  }
+
+  // Las ediciones, al final: no notifican a nadie, así que si la pasada se queda
+  // sin tiempo o sin cupo, lo justo es que cedan el turno a los avisos.
+  if (!cortado) {
+    for (const { fila, sala, previa, firma } of ediciones) {
+      if (editadas >= TG_MAX_EDICIONES) break; // el resto, en la siguiente pasada
+
+      await ritmo();
+      const { hecha, esperar, perdido } = await telegramEditar(
+        previa.chat,
+        previa.mensaje,
+        mensajeTelegram(fila, null, ahora)
+      );
+
+      if (!hecha) {
+        if (esperar > 0) {
+          log(`Telegram: me pide esperar ${esperar} s; dejo las ediciones para la siguiente pasada.`);
+          cortado = true;
+          break;
+        }
+        continue;
+      }
+
+      // Si el mensaje ya no existe se olvida el identificador y la fila vuelve a
+      // contar como anotada pero no publicada: no se reenvía —eso sería avisar dos
+      // veces de lo mismo— pero tampoco se reintenta editar cada pasada.
+      vigentes[fila.euvd] = perdido
+        ? { sala, fecha: previa.fecha, enviada: false, firma }
+        : { ...previa, firma };
+      editadas++;
     }
   }
 
@@ -929,9 +1119,11 @@ async function notificarTelegram(filas) {
   const desglose = Object.entries(enviadas)
     .map(([sala, n]) => `${sala} ${n}`)
     .join(", ");
-  const cola = candidatas.length - total;
+  const cola = envios.length - hechos + (ediciones.length - editadas);
   log(
     `Telegram: ${total} avisos enviados${desglose ? ` (${desglose})` : ""}` +
+      (mudadas ? `, ${mudadas} movidos de sala` : "") +
+      (editadas ? `, ${editadas} actualizados en el sitio` : "") +
       (cola > 0 ? `, ${cola} para la siguiente pasada${cortado ? " (me cortaron)" : ""}` : "")
   );
 }
@@ -1055,7 +1247,7 @@ const filas = [...registros.values()].sort((a, b) =>
 ); // más recientes primero
 
 await completarMeta(filas);
-await completarScores(filas);
+await completarCwesNvd(filas);
 await completarEpss(filas);
 await completarKev(filas);
 
@@ -1068,7 +1260,7 @@ const salida = {
   total: filas.length,
   totalEnEuvd: totalApi,
   fuente: "EU Vulnerability Database (ENISA)",
-  fuenteScore: "NVD (NIST), con la EUVD de respaldo",
+  fuenteScore: "EU Vulnerability Database (ENISA)",
   fuenteEpss: "EPSS de FIRST",
   fuenteKev: "CISA KEV y EU KEV, vía EUVD",
   fuenteCwe: "cve.org, con el NVD de respaldo",

@@ -3,11 +3,10 @@ import { useState, useEffect, useMemo, useRef, useDeferredValue, useCallback } f
 /**
  * Tabla de vulnerabilidades publicadas recientemente.
  *
- * Lee el JSON que genera euvd_sync.php por cron: el listado viene de la EUVD, el
- * nombre de cada fila es el título oficial de cve.org, la puntuación CVSS es la
- * del NVD —con la de la EUVD de respaldo (`origenScore`)—, las CWE salen del
- * registro de cve.org, la EPSS del modelo de FIRST y la marca de explotación
- * activa de los catálogos KEV. Si no encuentra el JSON,
+ * Lee el JSON que genera euvd_sync.php por cron: el listado y la puntuación CVSS
+ * vienen de la EUVD, el nombre de cada fila es el título oficial de cve.org, las
+ * CWE salen del registro de cve.org y del NVD, la EPSS del modelo de FIRST y la
+ * marca de explotación activa de los catálogos KEV. Si no encuentra el JSON,
  * carga un puñado de filas de ejemplo para que la interfaz sea navegable
  * mientras montas el backend.
  *
@@ -205,7 +204,6 @@ const EJEMPLO = {
       producto: "Sample product",
       score: 9.8,
       severidad: "critica",
-      origenScore: "nvd",
       cvss: "3.1",
       cwes: [{ id: "CWE-94", nombre: "Improper Control of Generation of Code" }],
       epss: 0.4212,
@@ -222,7 +220,6 @@ const EJEMPLO = {
       producto: "Endpoint agent",
       score: 7.8,
       severidad: "alta",
-      origenScore: "nvd",
       cvss: "3.1",
       cwes: [
         { id: "CWE-732", nombre: "Incorrect Permission Assignment for Critical Resource" },
@@ -241,7 +238,6 @@ const EJEMPLO = {
       producto: "Web portal",
       score: 6.1,
       severidad: "media",
-      origenScore: "nvd",
       cvss: "3.1",
       cwes: [{ id: "CWE-79", nombre: "Improper Neutralization of Input During Web Page Generation" }],
       epss: 0.0011,
@@ -253,12 +249,11 @@ const EJEMPLO = {
     {
       euvd: "EUVD-0000-0004",
       cve: "CVE-0000-00004",
-      nombre: "Sample: not analysed by the NVD, score taken from the EUVD",
+      nombre: "Sample: credentials stored in plain text in the billing API",
       vendor: "Third vendor",
       producto: "Billing API",
       score: 3.7,
       severidad: "baja",
-      origenScore: "euvd",
       cvss: "3.1",
       cwes: [{ id: "CWE-522", nombre: null }],
       epss: 0.0004,
@@ -274,7 +269,6 @@ const EJEMPLO = {
       producto: null,
       score: null,
       severidad: "sin_puntuar",
-      origenScore: null,
       cvss: null,
       cwes: [],
       epss: null,
@@ -731,8 +725,8 @@ export default function FeedVulnerabilidades() {
           <div className="euvd-titulo">
             <h1>Recently published vulnerabilities</h1>
             <p className="euvd-fuente">
-              EU Vulnerability Database (ENISA) · titles and CWEs from cve.org · CVSS from
-              the NVD · EPSS by FIRST · known exploitation from CISA/EU KEV
+              EU Vulnerability Database (ENISA) · CVSS from the EUVD · titles and CWEs
+              from cve.org · EPSS by FIRST · known exploitation from CISA/EU KEV
             </p>
             {frescura && (
               <span className="euvd-sync" title={`Last sync: ${sincronizado}`}>
@@ -1145,17 +1139,12 @@ export default function FeedVulnerabilidades() {
                         <b
                           style={{ color: sev.color }}
                           title={
-                            v.origenScore === "nvd"
-                              ? "CVSS from the NVD"
-                              : v.origenScore === "euvd"
-                              ? "CVSS from the EUVD: the NVD has not analysed it yet"
-                              : "No score in the NVD"
+                            v.score > 0
+                              ? "CVSS from the EUVD"
+                              : "The EUVD has not scored this CVE yet"
                           }
                         >
-                          {v.score != null ? v.score.toFixed(1) : "—"}
-                          {v.origenScore === "euvd" && (
-                            <span className="euvd-origen">EUVD</span>
-                          )}
+                          {v.score > 0 ? v.score.toFixed(1) : "—"}
                         </b>
                       </span>
                       <span className="euvd-sev-texto">{sev.etiqueta}</span>
@@ -1205,10 +1194,7 @@ export default function FeedVulnerabilidades() {
                         {v.cvss && (
                           <div>
                             <dt>CVSS</dt>
-                            <dd>
-                              v{v.cvss}
-                              {v.origenScore && ` · ${v.origenScore === "nvd" ? "NVD" : "EUVD"}`}
-                            </dd>
+                            <dd>v{v.cvss}</dd>
                           </div>
                         )}
                         {epss && (
