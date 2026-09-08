@@ -1,5 +1,6 @@
-# Vite copia este fichero a dist/ en cada build, así que sube dist/.htaccess
-# junto al resto a public_html/.
+# Vite copia este fichero a dist/ en cada build, y deploy.yml lo sube al docroot
+# del subdominio junto al index.html y a assets/. Este fichero es la fuente de
+# verdad: lo que se edite a mano en el servidor lo pisa el siguiente despliegue.
 
 # ------------------------------------------------------- nada de sync por web
 # euvd_sync.php vive aquí dentro para que su __DIR__ apunte a data/, pero no

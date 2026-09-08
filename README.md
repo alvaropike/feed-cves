@@ -24,9 +24,9 @@ corre en producción es la de Node, lanzada por **GitHub Actions**; ver "Dónde 
 ## Estructura en el hosting
 
 ```
-public_html/
-├── index.html          ← build de Vite
-├── assets/
+docroot del subdominio/   ← NO ~/public_html, que es el dominio raíz y aloja otra web
+├── index.html          ← build de Vite; lo sube deploy.yml en cada push al front
+├── assets/             ← el bundle con hash, ídem
 ├── data/
 │   ├── cves.json       ← lo sube el workflow en cada pasada
 │   ├── cve_meta.json   ← caché de títulos y CWE de cve.org, también del workflow
@@ -200,6 +200,40 @@ En PHP es `flock()`, que el sistema suelta al morir el proceso: no quedan cerroj
 Node no lo trae, así que usa un fichero con la hora de arranque y da por muerto lo que
 lleve más de 30 minutos (`LOCK_CADUCIDAD_MS`); si no, una ejecución matada a medias
 bloquearía el cron para siempre.
+
+## Cómo llega el front a producción
+
+`.github/workflows/deploy.yml`. Cada push a `main` que toque el front —el JSX, `src/`,
+`public/`, `index.html`, la config de Vite o el `package.json`— hace `npm ci && npm run
+build` y sube lo construido por el mismo FTP y con los mismos secretos que el sync. Un
+commit que solo toca el sync o este README no mueve el bundle de producción.
+
+Se sube en tres trozos, y ninguno puede tocar `data/`:
+
+- **`assets/`** se espeja con `--delete`, que es lo que retira los bundles viejos. Al ser un
+  directorio aparte, `data/` queda fuera de su alcance por construcción, no por cuidado.
+- **`index.html`** va por `.tmp` y se renombra, para que nadie se lo lleve a medias y se
+  quede sin bundle que cargar.
+- **`.htaccess`** se sube porque el repo es su fuente de verdad: es quien bloquea
+  `.notificado.json` y pone la caché de los JSON.
+
+Ojo con `dist/data/`: Vite copia `public/` tal cual, así que en un portátil donde se haya
+lanzado `npm run sync` ese directorio viene con los JSON dentro. No se sube nunca — los
+datos los pone el otro workflow, y subir aquí una copia vieja de `cves.json` retrocedería
+el feed varias horas de golpe.
+
+Y luego comprueba, que subir sin mirar es la mitad del trabajo: saca del `index.html`
+construido el nombre del bundle —lleva hash, así que no hay ambigüedad— y pide la web
+hasta cinco veces, hasta verla servir ese bundle y que el fichero conteste 200. Si no
+llega a cuadrar, el job falla, y un job que falla ahora avisa por Telegram.
+
+**Por qué no el Git de hPanel**, que sería lo obvio. Ese despliegue clona el repo entero en
+el docroot, y lo que el hosting tiene que servir no es el repo sino `dist/`: el `index.html`
+de la raíz apunta a `/src/main.jsx`, que en producción no existe, así que la web saldría en
+blanco. Sin SSH tampoco hay dónde ejecutar el build, de modo que habría que commitear
+`dist/` y aun así acabarían publicados el README, el `package.json` y los dos `euvd_sync`.
+Construir en Actions y subir solo lo construido evita las dos cosas.
+
 
 ## Avisos por Telegram
 

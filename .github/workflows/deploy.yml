@@ -1,0 +1,154 @@
+name: Publicar el front
+
+# El sync sube los JSON en cada pasada, pero el HTML y el bundle los subía una
+# persona a mano después de cada "npm run build". Esto lo cierra: se construye
+# aquí y se sube por el mismo FTP, con los mismos secretos.
+#
+# Por qué no el Git de hPanel, que sería lo obvio: ese despliegue clona el repo
+# entero en el docroot, y lo que el hosting tiene que servir no es el repo sino
+# dist/ — el index.html de la raíz apunta a /src/main.jsx, que en producción no
+# existe. Sin SSH tampoco hay forma de ejecutar el build allí, así que habría que
+# commitear dist/ y aun así acabarían publicados el README, el package.json y los
+# dos euvd_sync. Construir aquí y subir solo lo construido evita las dos cosas.
+
+on:
+  push:
+    branches: [main]
+    # Solo cuando cambia el front. Un commit que toca el sync o el README no
+    # tiene por qué mover el bundle de producción.
+    paths:
+      - 'FeedVulnerabilidades.jsx'
+      - 'src/**'
+      - 'public/**'
+      - 'index.html'
+      - 'vite.config.js'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-web
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Construir
+        run: |
+          npm ci
+          npm run build
+
+      # Vite copia public/ tal cual a dist/, así que dist/data/ existe y, en un
+      # portátil donde se haya lanzado el sync, viene con los JSON dentro. Eso no
+      # se sube nunca: los datos los pone el otro workflow, y subir aquí una copia
+      # vieja de cves.json sería retroceder el feed varias horas de golpe.
+      - name: Comprobar lo construido
+        id: build
+        run: |
+          test -f dist/index.html || { echo "No hay dist/index.html"; exit 1; }
+          test -f dist/.htaccess || { echo "No hay dist/.htaccess: ¿sigue en public/?"; exit 1; }
+
+          # El nombre del bundle lleva hash, así que sirve para comprobar después
+          # que lo que sirve la web es esto y no lo de antes.
+          bundle=$(grep -o 'assets/[A-Za-z0-9_.-]*\.js' dist/index.html | head -1)
+          test -n "$bundle" || { echo "El index.html no referencia ningún bundle"; exit 1; }
+          echo "bundle=$bundle" >> "$GITHUB_OUTPUT"
+          echo "Construido: $bundle"
+
+      # Mismos ajustes de red que el sync: el FTP del hosting a veces no abre el
+      # canal de datos y con los valores por defecto una pasada se comía cuatro
+      # minutos y medio de espera antes de rendirse.
+      #
+      # Se sube en tres trozos y ninguno puede tocar data/:
+      #   - assets/ se espeja con --delete, que es lo que retira los bundles
+      #     viejos; al ser un directorio aparte, data/ queda fuera de su alcance.
+      #   - index.html va por .tmp y se renombra, para que nadie se lo lleve a
+      #     medias y se quede sin bundle que cargar.
+      #   - .htaccess se sube porque el repo es su fuente de verdad: es quien
+      #     bloquea .notificado.json y pone la caché de los JSON.
+      #
+      # fail-exit a propósito: sin él lftp sigue con el resto de órdenes aunque
+      # una falle y el paso acabaría en verde con medio despliegue subido.
+      - name: Subir al hosting
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq lftp
+          lftp <<EOF
+          set ftp:ssl-force true
+          set ssl:verify-certificate no
+          set net:timeout 15
+          set net:max-retries 5
+          set net:reconnect-interval-base 5
+          set xfer:clobber on
+          set cmd:fail-exit yes
+          open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
+          mirror -R --delete --verbose dist/assets assets
+          put dist/index.html -o "index.html.tmp"
+          mv "index.html.tmp" "index.html"
+          put dist/.htaccess -o ".htaccess"
+          bye
+          EOF
+
+      # Subir sin mirar es la mitad del trabajo: si el mirror deja el bundle a
+      # medias o Cloudflare sigue sirviendo el index viejo, esto lo dice. Se
+      # reintenta porque una subida por FTP y una caché de borde no se ponen de
+      # acuerdo al instante.
+      - name: Comprobar que la web sirve lo nuevo
+        env:
+          SITIO_URL: ${{ vars.SITIO_URL }}
+          BUNDLE: ${{ steps.build.outputs.bundle }}
+        run: |
+          if [ -z "$SITIO_URL" ]; then
+            echo "Sin la variable SITIO_URL: no puedo comprobar el despliegue." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          raiz="${SITIO_URL%/}"
+          for intento in 1 2 3 4 5; do
+            html=$(curl -sS --max-time 20 -H 'Cache-Control: no-cache' "$raiz/index.html?t=$(date -u +%s)" 2>&1) || true
+            case "$html" in
+              *"$BUNDLE"*)
+                codigo=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "$raiz/$BUNDLE") || codigo=000
+                if [ "$codigo" = "200" ]; then
+                  echo "La web sirve $BUNDLE y el bundle responde 200."
+                  echo "Publicado \`$BUNDLE\`" >> "$GITHUB_STEP_SUMMARY"
+                  exit 0
+                fi
+                echo "El index ya apunta a $BUNDLE, pero el bundle contesta $codigo."
+                ;;
+              *) echo "Intento $intento: la web todavía no sirve $BUNDLE." ;;
+            esac
+            sleep 6
+          done
+
+          echo "La web no acaba de servir $BUNDLE."
+          exit 1
+
+      - name: Avisar si el despliegue ha fallado
+        if: failure()
+        env:
+          ENLACE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_AVISOS: ${{ secrets.TELEGRAM_CHAT_AVISOS }}
+          TELEGRAM_CHAT_KEV: ${{ secrets.TELEGRAM_CHAT_KEV }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          aviso="🔴 <b>El despliegue del front ha fallado</b>"
+          aviso="$aviso\nLa web sigue con la versión anterior; los datos no se tocan, esos van por su workflow."
+          aviso="$aviso\n<a href=\"$ENLACE\">Ver el run</a>"
+          sh .github/avisar.sh "$(printf '%b' "$aviso")"
