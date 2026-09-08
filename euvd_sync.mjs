@@ -75,6 +75,22 @@ const TG_MAX_MENSAJES = 12; // por sala y pasada; lo que sobre se avisa en la si
 // para que una tanda de puestas al día no se coma la pasada entera a 3,5 s cada
 // una. Lo que no entre se edita en la siguiente.
 const TG_MAX_EDICIONES = 40; // por pasada, sumando todas las salas
+
+// Cuánto puede llevar una fila en el catálogo de KEV para que su primer aviso
+// siga siendo una noticia. La ventana ya filtra por fecha de publicación, pero
+// el catálogo mete ~1.300 CVE explotadas de las que casi todas son de hace años.
+// Ver esNoticia().
+const TG_DIAS_NOTICIA = 7;
+
+// Cuánto se recuerda una fila que ha dejado de aparecer. Antes se olvidaba en
+// cuanto faltaba de una pasada, y eso convertía cualquier tropiezo de la API en
+// un reaviso masivo: una página de la EUVD que falla o un catálogo de KEV que no
+// baja dejan la lista a medias, se borran esos apuntes, y a la pasada siguiente
+// vuelven las filas sin nada anotado y se avisan como si fueran nuevas. Una
+// ventana entera de margen: el fichero no llega al doble y hacen falta dos
+// semanas de fallos seguidos para perder un apunte que aún importa.
+const TG_OLVIDO_DIAS = 14;
+
 // El límite que manda no es el del chat sino el del grupo: unos 20 mensajes por
 // minuto. Con las seis salas montadas como temas de un mismo grupo, los 1,2 s de
 // antes iban a ~50/min contra ese tope y Telegram devolvía 429 (visto el
@@ -693,6 +709,26 @@ const prioridadSala = (sala) => TG_ORDEN.indexOf(sala);
 /** Cada fila va a una sola sala: la de KEV si consta explotada, si no la de su severidad. */
 const salaDe = (fila) => (fila.kev ? "kev" : fila.severidad);
 
+/**
+ * Si el primer aviso de una fila todavía es una noticia.
+ *
+ * Lo que trae la ventana lo es por definición: son catorce días de
+ * publicaciones. Lo que trae el catálogo de KEV, no —la mayoría se explota desde
+ * hace años—, y ahí lo único que es noticia es haber entrado en el catálogo hace
+ * poco: una CVE de 2021 que CISA añade hoy sí importa, la misma CVE añadida en
+ * 2022 no.
+ *
+ * Solo decide el primer aviso. Una fila ya anotada sigue su camino de siempre por
+ * vieja que sea: si cambia se edita, y si cambia de sala se muda a la que toque.
+ */
+function esNoticia(fila, ahoraIso) {
+  if (!fila.fueraDeVentana) return true;
+
+  const entrada = Date.parse(fila.kev?.fecha ?? "");
+  if (Number.isNaN(entrada)) return false;
+  return Date.parse(ahoraIso) - entrada <= TG_DIAS_NOTICIA * 86400000;
+}
+
 // Las bandas de EPSS que cuentan como cambio. El modelo de FIRST se recalcula a
 // diario y casi ninguna CVE conserva el mismo decimal de un día para otro: sin
 // bandas habría que reeditar la ventana entera cada día, que son miles de
@@ -1008,7 +1044,9 @@ async function telegramBorrar(chat, mensaje) {
  *
  * Con eso, tres caminos:
  *
- *   - Sin mensaje previo: se envía, como siempre.
+ *   - Sin mensaje previo: se envía, si todavía es una noticia. Lo de la ventana
+ *     siempre lo es; lo que entra por el catálogo de KEV, solo si acaba de entrar
+ *     en él. Ver esNoticia().
  *   - Misma sala y firma distinta: se edita en el sitio. Telegram no notifica las
  *     ediciones de un bot, así que el mensaje se pone al día sin sonar y sin
  *     moverse del tema, que es lo que se quiere para un 3.1 que pasa a 3.4.
@@ -1021,7 +1059,10 @@ async function telegramBorrar(chat, mensaje) {
  * la sala dejaría de querer decir lo que dice.
  *
  * Lo que sale de la ventana deja de mantenerse y su último mensaje se queda
- * publicado tal cual: la alternativa era guardar el estado para siempre.
+ * publicado tal cual: la alternativa era guardar el estado para siempre. Pero el
+ * apunte sobrevive TG_OLVIDO_DIAS a la última vez que se vio la fila, no a la
+ * pasada en que faltó: sin ese margen, media ventana que no se descargue un día
+ * es media ventana reavisada al siguiente.
  *
  * Las filas sin sala configurada se anotan igual, sin enviar. Así, el día que
  * montes la sala de medias, no te caen encima las 1.700 de la ventana: solo llega
@@ -1068,18 +1109,41 @@ async function notificarTelegram(filas) {
   const hayFueraDeVentana = filas.some((f) => f.fueraDeVentana);
   const marcaKev = (ahora) => estado.sembradoKev ?? (hayFueraDeVentana ? ahora : undefined);
 
-  // La poda: nos quedamos con lo que sigue dentro de la ventana, como las demás
-  // cachés, para que el fichero no crezca sin fin.
+  const ahora = new Date().toISOString();
+
+  // La poda: lo que sigue apareciendo se marca visto, y lo que lleva
+  // TG_OLVIDO_DIAS sin aparecer se olvida, para que el fichero no crezca sin fin.
+  //
+  // Lo que no vale es quedarse solo con lo que trae esta pasada. `filas` no es la
+  // ventana, es lo que se ha podido descargar de la ventana: una página que falla
+  // o un catálogo de KEV que no baja se lleva por delante cientos de apuntes, y
+  // sin apunte esas filas vuelven a contar como no avisadas en la pasada
+  // siguiente. Así es como acaban en la sala de KEV CVE de hace años.
+  const presentes = new Set(filas.map((f) => f.euvd));
+  const olvidar = Date.parse(ahora) - TG_OLVIDO_DIAS * 86400000;
   const vigentes = {};
-  for (const fila of filas) {
-    if (Object.hasOwn(previas, fila.euvd)) vigentes[fila.euvd] = previas[fila.euvd];
+  for (const [euvd, previa] of Object.entries(previas)) {
+    if (presentes.has(euvd)) {
+      vigentes[euvd] = previa && typeof previa === "object" ? { ...previa, visto: ahora } : previa;
+      continue;
+    }
+
+    // Sin fecha que mirar —las entradas del formato viejo son una cadena— se deja
+    // caer: ese formato lo reconstruye entero el bloque de siembra de más abajo.
+    const visto = Date.parse(previa?.visto ?? previa?.fecha ?? "");
+    if (!Number.isNaN(visto) && visto >= olvidar) vigentes[euvd] = previa;
   }
 
   if (primeraVez || formatoViejo) {
-    const ahora = new Date().toISOString();
     for (const fila of filas) {
       const sala = salaDe(fila);
-      vigentes[fila.euvd] = { sala, fecha: ahora, enviada: false, firma: firmaFila(fila, sala) };
+      vigentes[fila.euvd] = {
+        sala,
+        fecha: ahora,
+        visto: ahora,
+        enviada: false,
+        firma: firmaFila(fila, sala),
+      };
     }
 
     await escribirJson(estadoTelegram, {
@@ -1094,7 +1158,6 @@ async function notificarTelegram(filas) {
     return;
   }
 
-  const ahora = new Date().toISOString();
   const envios = []; // primer aviso y mudanzas: los dos acaban en un sendMessage
   const ediciones = []; // misma sala, contenido distinto
 
@@ -1107,7 +1170,16 @@ async function notificarTelegram(filas) {
     // La siembra del catálogo: solo la primera vez y solo lo que entra por él.
     // Lo que ya estaba anotado sigue su camino normal, incluidas las ediciones.
     if (kevSinSembrar && fila.fueraDeVentana && !previa) {
-      vigentes[fila.euvd] = { sala, fecha: ahora, enviada: false, firma };
+      vigentes[fila.euvd] = { sala, fecha: ahora, visto: ahora, enviada: false, firma };
+      continue;
+    }
+
+    // Primer aviso de algo que ya no es noticia: se anota callado, como la
+    // siembra. Es la red que hace que el estado no sea lo único que separa la sala
+    // de KEV de un volcado del catálogo: aunque el fichero se pierda entero, de
+    // fuera de la ventana solo se avisa lo que acaba de entrar en KEV.
+    if (!previa && !esNoticia(fila, ahora)) {
+      vigentes[fila.euvd] = { sala, fecha: ahora, visto: ahora, enviada: false, firma };
       continue;
     }
 
@@ -1123,7 +1195,7 @@ async function notificarTelegram(filas) {
     // sala. Si venía publicada de otra, se borra: allí ya no pinta nada.
     if (!destino) {
       if (previa?.mensaje) envios.push({ fila, sala, destino: "", previa, firma, soloBorrar: true });
-      else vigentes[fila.euvd] = { sala, fecha: ahora, enviada: false, firma };
+      else vigentes[fila.euvd] = { sala, fecha: ahora, visto: ahora, enviada: false, firma };
       continue;
     }
 
@@ -1167,7 +1239,7 @@ async function notificarTelegram(filas) {
     const cupo = (enviadas[sala] ?? 0) + 1;
     if (!soloBorrar && cupo > TG_MAX_MENSAJES) continue; // sin marcar: sale en la siguiente pasada
 
-    let apunte = { sala, fecha: ahora, enviada: false, firma };
+    let apunte = { sala, fecha: ahora, visto: ahora, enviada: false, firma };
 
     if (!soloBorrar) {
       // El encabezado de mudanza solo tiene sentido si de la anterior se llegó a
@@ -1187,7 +1259,7 @@ async function notificarTelegram(filas) {
         continue; // sin marcar: se reintenta en la siguiente pasada
       }
 
-      apunte = { sala, fecha: ahora, enviada: true, chat, mensaje, firma };
+      apunte = { sala, fecha: ahora, visto: ahora, enviada: true, chat, mensaje, firma };
       enviadas[sala] = cupo;
       total++;
     }
@@ -1232,7 +1304,7 @@ async function notificarTelegram(filas) {
       // contar como anotada pero no publicada: no se reenvía —eso sería avisar dos
       // veces de lo mismo— pero tampoco se reintenta editar cada pasada.
       vigentes[fila.euvd] = perdido
-        ? { sala, fecha: previa.fecha, enviada: false, firma }
+        ? { sala, fecha: previa.fecha, visto: ahora, enviada: false, firma }
         : { ...previa, firma };
       editadas++;
     }

@@ -61,6 +61,21 @@ const TG_MAX_EDICIONES = 40;      // ediciones por pasada, sumando todas las sal
 // ritmo en ~17/min, por debajo del límite.
 const TG_PAUSA_US     = 3500000;
 
+// Cuántos días puede llevar una fila en el catálogo de KEV para que su primer
+// aviso siga siendo una noticia. La ventana ya filtra por fecha de publicación,
+// pero el catálogo mete ~1.300 CVE explotadas de las que casi todas son de hace
+// años. Ver es_noticia().
+const TG_DIAS_NOTICIA = 7;
+
+// Cuánto se recuerda una fila que ha dejado de aparecer. Antes se olvidaba en
+// cuanto faltaba de una pasada, y eso convertía cualquier tropiezo de la API en
+// un reaviso masivo: una página de la EUVD que falla o un catálogo de KEV que no
+// baja dejan la lista a medias, se borran esos apuntes, y a la pasada siguiente
+// vuelven las filas sin nada anotado y se avisan como si fueran nuevas. Una
+// ventana entera de margen: el fichero no llega al doble y hacen falta dos
+// semanas de fallos seguidos para perder un apunte que aún importa.
+const TG_OLVIDO_DIAS  = 14;
+
 // Opcional: exporta NVD_API_KEY en el cron y el límite sube de 5 a 50 peticiones/30 s.
 $nvd_clave = getenv('NVD_API_KEY') ?: '';
 $nvd_pausa_us = $nvd_clave ? 1000000 : 6500000;
@@ -887,6 +902,35 @@ function sala_de(array $fila): string
     return is_array($fila['kev']) ? 'kev' : (string) $fila['severidad'];
 }
 
+/**
+ * Si el primer aviso de una fila todavía es una noticia.
+ *
+ * Lo que trae la ventana lo es por definición: son catorce días de
+ * publicaciones. Lo que trae el catálogo de KEV, no —la mayoría se explota desde
+ * hace años—, y ahí lo único que es noticia es haber entrado en el catálogo hace
+ * poco: una CVE de 2021 que CISA añade hoy sí importa, la misma CVE añadida en
+ * 2022 no.
+ *
+ * Solo decide el primer aviso. Una fila ya anotada sigue su camino de siempre por
+ * vieja que sea: si cambia se edita, y si cambia de sala se muda a la que toque.
+ *
+ * @param array<string,mixed> $fila
+ */
+function es_noticia(array $fila, string $ahora_iso): bool
+{
+    if (($fila['fueraDeVentana'] ?? false) !== true) {
+        return true;
+    }
+
+    $entrada = is_array($fila['kev'] ?? null) ? ($fila['kev']['fecha'] ?? null) : null;
+    $t = is_string($entrada) ? strtotime($entrada) : false;
+    if ($t === false) {
+        return false;
+    }
+
+    return (strtotime($ahora_iso) - $t) <= TG_DIAS_NOTICIA * 86400;
+}
+
 // Las bandas de EPSS que cuentan como cambio. El modelo de FIRST se recalcula a
 // diario y casi ninguna CVE conserva el mismo decimal de un día para otro: sin
 // bandas habría que reeditar la ventana entera cada día, que son miles de
@@ -1319,7 +1363,9 @@ function telegram_borrar(string $token, string $chat, int $mensaje): array
  *
  * Con eso, tres caminos:
  *
- *   - Sin mensaje previo: se envía, como siempre.
+ *   - Sin mensaje previo: se envía, si todavía es una noticia. Lo de la ventana
+ *     siempre lo es; lo que entra por el catálogo de KEV, solo si acaba de entrar
+ *     en él. Ver es_noticia().
  *   - Misma sala y firma distinta: se edita en el sitio. Telegram no notifica las
  *     ediciones de un bot, así que el mensaje se pone al día sin sonar y sin
  *     moverse del tema, que es lo que se quiere para un 3.1 que pasa a 3.4.
@@ -1332,7 +1378,10 @@ function telegram_borrar(string $token, string $chat, int $mensaje): array
  * la sala dejaría de querer decir lo que dice.
  *
  * Lo que sale de la ventana deja de mantenerse y su último mensaje se queda
- * publicado tal cual: la alternativa era guardar el estado para siempre.
+ * publicado tal cual: la alternativa era guardar el estado para siempre. Pero el
+ * apunte sobrevive TG_OLVIDO_DIAS a la última vez que se vio la fila, no a la
+ * pasada en que faltó: sin ese margen, media ventana que no se descargue un día
+ * es media ventana reavisada al siguiente.
  *
  * Las filas sin sala configurada se anotan igual, sin enviar. Así, el día que
  * montes la sala de medias, no te caen encima las 1.700 de la ventana: solo llega
@@ -1394,16 +1443,40 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
         }
     }
 
-    // La poda: nos quedamos con lo que sigue dentro de la ventana, como las demás
-    // cachés, para que el fichero no crezca sin fin.
-    $vigentes = [];
+    $ahora = gmdate('c');
+
+    // La poda: lo que sigue apareciendo se marca visto, y lo que lleva
+    // TG_OLVIDO_DIAS sin aparecer se olvida, para que el fichero no crezca sin fin.
+    //
+    // Lo que no vale es quedarse solo con lo que trae esta pasada. $filas no es la
+    // ventana, es lo que se ha podido descargar de la ventana: una página que falla
+    // o un catálogo de KEV que no baja se lleva por delante cientos de apuntes, y
+    // sin apunte esas filas vuelven a contar como no avisadas en la pasada
+    // siguiente. Así es como acaban en la sala de KEV CVE de hace años.
+    $presentes = [];
     foreach ($filas as $fila) {
-        if (isset($previas[$fila['euvd']])) {
-            $vigentes[$fila['euvd']] = $previas[$fila['euvd']];
-        }
+        $presentes[$fila['euvd']] = true;
     }
 
-    $ahora = gmdate('c');
+    $olvidar  = strtotime($ahora) - TG_OLVIDO_DIAS * 86400;
+    $vigentes = [];
+    foreach ($previas as $euvd => $previa) {
+        if (isset($presentes[$euvd])) {
+            if (is_array($previa)) {
+                $previa['visto'] = $ahora;
+            }
+            $vigentes[$euvd] = $previa;
+            continue;
+        }
+
+        // Sin fecha que mirar —las entradas del formato viejo son una cadena— se deja
+        // caer: ese formato lo reconstruye entero el bloque de siembra de más abajo.
+        $visto = is_array($previa) ? ($previa['visto'] ?? $previa['fecha'] ?? null) : null;
+        $t = is_string($visto) ? strtotime($visto) : false;
+        if ($t !== false && $t >= $olvidar) {
+            $vigentes[$euvd] = $previa;
+        }
+    }
 
     // Igual que en el .mjs: si no hay marcador y tampoco hay nada sembrado, la
     // clave se omite y el marcador queda para la pasada que sí traiga catálogo.
@@ -1421,6 +1494,7 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
             $vigentes[$fila['euvd']] = [
                 'sala'    => $sala,
                 'fecha'   => $ahora,
+                'visto'   => $ahora,
                 'enviada' => false,
                 'firma'   => firma_fila($fila, $sala),
             ];
@@ -1448,7 +1522,20 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
         // Lo que ya estaba anotado sigue su camino normal, incluidas las ediciones.
         if ($kev_sin_sembrar && ($fila['fueraDeVentana'] ?? false) === true && $previa === null) {
             $vigentes[$fila['euvd']] = [
-                'sala' => $sala, 'fecha' => $ahora, 'enviada' => false, 'firma' => $firma,
+                'sala' => $sala, 'fecha' => $ahora, 'visto' => $ahora,
+                'enviada' => false, 'firma' => $firma,
+            ];
+            continue;
+        }
+
+        // Primer aviso de algo que ya no es noticia: se anota callado, como la
+        // siembra. Es la red que hace que el estado no sea lo único que separa la sala
+        // de KEV de un volcado del catálogo: aunque el fichero se pierda entero, de
+        // fuera de la ventana solo se avisa lo que acaba de entrar en KEV.
+        if ($previa === null && !es_noticia($fila, $ahora)) {
+            $vigentes[$fila['euvd']] = [
+                'sala' => $sala, 'fecha' => $ahora, 'visto' => $ahora,
+                'enviada' => false, 'firma' => $firma,
             ];
             continue;
         }
@@ -1477,7 +1564,8 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
                 ];
             } else {
                 $vigentes[$fila['euvd']] = [
-                    'sala' => $sala, 'fecha' => $ahora, 'enviada' => false, 'firma' => $firma,
+                    'sala' => $sala, 'fecha' => $ahora, 'visto' => $ahora,
+                    'enviada' => false, 'firma' => $firma,
                 ];
             }
             continue;
@@ -1528,7 +1616,10 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
         }
 
         $previa = $e['previa'];
-        $apunte = ['sala' => $e['sala'], 'fecha' => $ahora, 'enviada' => false, 'firma' => $e['firma']];
+        $apunte = [
+            'sala' => $e['sala'], 'fecha' => $ahora, 'visto' => $ahora,
+            'enviada' => false, 'firma' => $e['firma'],
+        ];
 
         if (!$e['solo_borrar']) {
             // El encabezado de mudanza solo tiene sentido si de la anterior se llegó a
@@ -1555,6 +1646,7 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
             $apunte = [
                 'sala'    => $e['sala'],
                 'fecha'   => $ahora,
+                'visto'   => $ahora,
                 'enviada' => true,
                 'chat'    => $r['chat'],
                 'mensaje' => $r['mensaje'],
@@ -1616,6 +1708,7 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
                 $vigentes[$ed['fila']['euvd']] = [
                     'sala'    => $ed['sala'],
                     'fecha'   => $previa['fecha'],
+                    'visto'   => $ahora,
                     'enviada' => false,
                     'firma'   => $ed['firma'],
                 ];

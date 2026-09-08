@@ -431,8 +431,25 @@ junto al script y fuera de `data/`, que es un directorio que se publica.
 Tiene que ser así porque la ventana de 14 días se solapa entre pasadas y porque los datos
 llegan tarde: una CVE entra hoy sin CVSS, sale como "Sin puntuar" y recibe su 9.8 tres
 pasadas después. Filtrando por fecha, esa no se avisaría nunca; llevando la cuenta de lo
-enviado y de dónde, se avisa el día que le toca y no se repite. El fichero se poda en cada
-ejecución con las que siguen dentro de la ventana, igual que las demás cachés.
+enviado y de dónde, se avisa el día que le toca y no se repite.
+
+El fichero se poda por **cuándo se vio la fila por última vez**, no por si aparece en la
+pasada de ahora: lo que lleve más de `TG_OLVIDO_DIAS` (14) sin verse se olvida, y lo demás se
+queda. La diferencia importa porque lo que trae una pasada no es la ventana, es lo que se ha
+podido descargar de la ventana: una página de la EUVD que falla o un catálogo de KEV que no
+baja dejan la lista a medias, y podando por presencia esos cientos de apuntes desaparecían.
+Sin apunte, esas mismas filas cuentan como no avisadas en la pasada siguiente y se vuelven a
+mandar — que es como acababan en la sala de KEV CVE de hace años.
+
+Y como red aparte del fichero, **el primer aviso de una fila tiene que ser una noticia**. Lo
+que trae la ventana lo es por definición: son catorce días de publicaciones. Lo que trae el
+catálogo de KEV, no —la mayoría se explota desde hace años—, así que de esas solo se avisa si
+entraron en el catálogo hace menos de `TG_DIAS_NOTICIA` (7 días). Una CVE de 2021 que CISA
+añade hoy sí importa; la misma añadida en 2022, no. Aunque se pierda el estado entero, lo
+viejo no vuelve a la sala.
+
+El filtro solo decide el **primer** aviso. Una fila ya anotada sigue su camino por vieja que
+sea: si cambia se edita en el sitio, y si cambia de sala se muda a la que le toque.
 
 Las filas cuya sala no está montada **se anotan igual, sin enviarse**. Por eso el día que
 añadas la sala de medias no te caen encima las 1.700 de la ventana: solo llega lo que
@@ -626,6 +643,10 @@ en la sala de KEV: más de una hora de mensajes sobre cosas explotadas desde hac
 partir de ahí sí llega lo que entre nuevo en el catálogo, que es el mismo trato que reciben
 las salas recién montadas. Si el catálogo falla en esa pasada, la marca no se pone y la
 siembra espera a la siguiente.
+
+Esa marca es de un solo uso, así que no basta: lo que de verdad sostiene la sala es el filtro
+de `TG_DIAS_NOTICIA` — de fuera de la ventana solo se avisa lo que acaba de entrar en el
+catálogo. Ver "Nuevo no es reciente".
 
 ## El top por prioridad
 
