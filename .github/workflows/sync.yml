@@ -218,6 +218,10 @@ jobs:
           # el valor por defecto del script.
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_UMBRAL: ${{ secrets.TELEGRAM_UMBRAL }}
+          # Freno de mano, variable del repo (Settings -> Variables): a 1 la pasada
+          # publica la web como siempre pero no toca Telegram. Se quita borrando la
+          # variable o poniendola a 0; no hace falta tocar el codigo.
+          TELEGRAM_PAUSA: ${{ vars.TELEGRAM_PAUSA }}
         run: |
           if [ "$MODO" = "completo" ]; then
             node euvd_sync.mjs

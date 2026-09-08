@@ -70,6 +70,14 @@ const TG_SALAS = {
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID ?? "";
 const TG_UMBRAL = Number(process.env.TELEGRAM_UMBRAL ?? "7"); // solo filtra lo que cae en el respaldo
 
+// El freno de mano. Con la pausa puesta la pasada sigue haciendo todo lo demás
+// —descargar, enriquecer y publicar la web— pero no manda, no edita y no borra
+// nada en Telegram: se limita a anotar en silencio lo que va saliendo, igual que
+// una siembra. Es a propósito que no encole: una pausa que guarda todo lo que no
+// mandó es una bomba de relojería, y al quitarla saldrían de golpe los avisos de
+// los días que estuvo parada.
+const TG_PAUSA = /^(1|si|sí|true|on)$/i.test(process.env.TELEGRAM_PAUSA ?? "");
+
 const TG_MAX_MENSAJES = 12; // por sala y pasada; lo que sobre se avisa en la siguiente
 // Las ediciones son silenciosas, así que pueden esperar: este tope existe solo
 // para que una tanda de puestas al día no se coma la pasada entera a 3,5 s cada
@@ -1132,6 +1140,33 @@ async function notificarTelegram(filas) {
     // caer: ese formato lo reconstruye entero el bloque de siembra de más abajo.
     const visto = Date.parse(previa?.visto ?? previa?.fecha ?? "");
     if (!Number.isNaN(visto) && visto >= olvidar) vigentes[euvd] = previa;
+  }
+
+  // La pausa va antes que nada: ni siembra, ni avisos, ni ediciones. Lo que hay
+  // se anota como visto y ahí se queda. Si una fila ya tenía mensaje publicado se
+  // conserva su apunte tal cual —identificador y sala incluidos— para que al
+  // reanudar se pueda seguir editando y moviendo en vez de duplicarla.
+  if (TG_PAUSA) {
+    for (const fila of filas) {
+      const sala = salaDe(fila);
+      const previa = vigentes[fila.euvd] ?? null;
+      const firma = firmaFila(fila, sala);
+      vigentes[fila.euvd] =
+        previa && typeof previa === "object"
+          ? { ...previa, visto: ahora, firma }
+          : { sala, fecha: ahora, visto: ahora, enviada: false, firma };
+    }
+
+    await escribirJson(estadoTelegram, {
+      sembrado: estado.sembrado ?? ahora,
+      sembradoKev: marcaKev(ahora),
+      avisadas: vigentes,
+    });
+    log(
+      `Telegram: en pausa (TELEGRAM_PAUSA). Anotadas ${filas.length} vulnerabilidades sin avisar; ` +
+        "quita la pausa para que vuelvan a salir avisos de lo que aparezca a partir de entonces."
+    );
+    return;
   }
 
   if (primeraVez || formatoViejo) {
