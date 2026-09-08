@@ -1,0 +1,107 @@
+name: Limpiar el tema de KEV
+
+# De un solo uso, y solo a mano. Retira del tema de KEV los mensajes que mandó la
+# poda vieja de .notificado.json: filas del catálogo, explotadas desde hace años,
+# avisadas meses después de entrar en él. El fallo que las mandaba ya está
+# arreglado en euvd_sync.mjs; esto limpia lo que quedó publicado.
+#
+# Corre aquí y no en local porque el estado vive en el servidor y las
+# credenciales del FTP son secretos del repo.
+#
+# Empieza siempre en ensayo: sin marcar "en_serio" lista lo que borraría y no
+# toca nada. Mira el resumen antes de lanzarlo de verdad.
+
+on:
+  workflow_dispatch:
+    inputs:
+      en_serio:
+        description: 'Borrar de verdad (sin marcar, solo lista lo que haría)'
+        type: boolean
+        default: false
+
+# El mismo grupo que el sync: esto reescribe .notificado.json, así que no puede
+# solaparse con una pasada o se pisarían el estado.
+concurrency:
+  group: sync-euvd
+  cancel-in-progress: false
+
+jobs:
+  limpiar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90 # 3,5 s por borrado; con margen para un tema muy sucio
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar lftp
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lftp
+
+      # Falla a propósito si no baja el estado: sin él no hay nada que decidir, y
+      # seguir sería quedarse mirando un fichero vacío y no borrar nada.
+      - name: Traer el estado y el feed del servidor
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          mkdir -p public/data
+          lftp <<EOF
+          set ftp:ssl-force true
+          set ssl:verify-certificate no
+          set net:timeout 15
+          set net:max-retries 5
+          set net:reconnect-interval-base 5
+          set xfer:clobber on
+          set cmd:fail-exit yes
+          open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
+          get .notificado.json -o .notificado.json
+          mget -O public/data "data/cves.json"
+          bye
+          EOF
+          node -e 'const s=require("./.notificado.json");console.log("estado:",Object.keys(s.avisadas||{}).length,"apuntes, sembrado",s.sembrado,"| sembradoKev",s.sembradoKev)'
+
+      - name: Limpiar
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          LIMPIAR_EN_SERIO: ${{ inputs.en_serio && '1' || '0' }}
+        run: |
+          node .github/limpiar-kev.mjs | tee salida.txt
+          {
+            echo '### Limpieza del tema de KEV'
+            echo ''
+            echo "Modo: ${{ inputs.en_serio && 'BORRANDO DE VERDAD' || 'ensayo' }}"
+            echo ''
+            echo '```'
+            cat salida.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Solo si se ha borrado de verdad: en ensayo el estado no ha cambiado y
+      # subirlo sería pisar el del servidor con una copia sin motivo.
+      #
+      # Va con always() a propósito. Si el job se cae a mitad, los mensajes ya
+      # borrados lo están; subir el estado tal y como quedó es lo que evita que el
+      # sync se pase la vida intentando editar mensajes que ya no existen.
+      - name: Devolver el estado al servidor
+        if: always() && inputs.en_serio
+        env:
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        run: |
+          lftp <<EOF
+          set ftp:ssl-force true
+          set ssl:verify-certificate no
+          set net:timeout 15
+          set net:max-retries 5
+          set net:reconnect-interval-base 5
+          set xfer:clobber on
+          set cmd:fail-exit yes
+          open -u "$FTP_USER","$FTP_PASSWORD" "$FTP_HOST"
+          put .notificado.json -o .notificado.json
+          bye
+          EOF
