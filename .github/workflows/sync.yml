@@ -222,6 +222,9 @@ jobs:
           # publica la web como siempre pero no toca Telegram. Se quita borrando la
           # variable o poniendola a 0; no hace falta tocar el codigo.
           TELEGRAM_PAUSA: ${{ vars.TELEGRAM_PAUSA }}
+          # Arranque en frio, tambien variable del repo: marca ISO por debajo de la
+          # cual nada entra en el feed. Vacia = sin corte. Ver el README.
+          SYNC_DESDE: ${{ vars.SYNC_DESDE }}
         run: |
           if [ "$MODO" = "completo" ]; then
             node euvd_sync.mjs

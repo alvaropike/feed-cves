@@ -26,10 +26,27 @@ const API_KEV = "https://euvdservices.enisa.europa.eu/api/kev/dump"; // CISA KEV
 const API_ENISAID = "https://euvdservices.enisa.europa.eu/api/enisaid"; // ficha suelta, por id
 const VENTANA_DIAS = 14; // cuántos días hacia atrás pedir
 const PAGE_SIZE = 100; // máximo que admite la API
-// La ventana de 14 días ronda las 5.000 vulnerabilidades, así que 25 páginas se
+// La ventana de 14 días ronda las 6.000 vulnerabilidades, así que 25 páginas se
 // quedaban con la mitad —y no con la mitad más reciente, sino con las que
 // devolviera la API—. El tope sigue existiendo por seguridad, pero ahora holgado.
-const MAX_PAGINAS = 60; // tope de seguridad: 60 * 100 = 6.000 registros
+//
+// A 60 se volvió a quedar corto el 2026-09-08: la EUVD decía 6.039 y bajaban
+// 6.000. Y una descarga corta no es solo una web incompleta: lo que falta hoy
+// entra mañana como si acabara de salir, que fue justo lo que llenó la cola de
+// Telegram con 900 avisos de vulnerabilidades de hasta dos semanas.
+const MAX_PAGINAS = 100; // tope de seguridad: 100 * 100 = 10.000 registros
+
+// Arranque en frío. Nada anterior a esta marca entra en el feed, aunque la EUVD
+// lo siga devolviendo dentro de la ventana. Existe para poder vaciar el feed y
+// empezar de cero: sin ella, la pasada siguiente al borrado lo rellena otra vez
+// con los 14 días de historia que la API sigue trayendo, y Telegram los toma por
+// novedades. Es temporal por naturaleza: a los VENTANA_DIAS días la ventana ya no
+// alcanza al corte y deja de descartar nada, así que se puede quitar y todo sigue
+// igual. Vacía —lo normal— significa sin corte.
+//
+// El precio, y solo durante esos 14 días: una vulnerabilidad que la EUVD publique
+// con fecha anterior al corte no aparece. Se prefiere eso a la avalancha.
+const CORTE = process.env.SYNC_DESDE ?? "";
 const PAUSA_MS = 400; // 0,4 s entre peticiones, para no castigar la API
 const TIMEOUT_MS = 30000;
 const CONCURRENCIA_TITULOS = 6; // peticiones simultáneas a cve.org
@@ -76,7 +93,7 @@ const TG_UMBRAL = Number(process.env.TELEGRAM_UMBRAL ?? "7"); // solo filtra lo 
 // una siembra. Es a propósito que no encole: una pausa que guarda todo lo que no
 // mandó es una bomba de relojería, y al quitarla saldrían de golpe los avisos de
 // los días que estuvo parada.
-const TG_PAUSA = /^(1|si|sí|true|on)$/i.test(process.env.TELEGRAM_PAUSA ?? "");
+const TG_EN_PAUSA = /^(1|si|sí|true|on)$/i.test(process.env.TELEGRAM_PAUSA ?? "");
 
 const TG_MAX_MENSAJES = 12; // por sala y pasada; lo que sobre se avisa en la siguiente
 // Las ediciones son silenciosas, así que pueden esperar: este tope existe solo
@@ -1146,7 +1163,7 @@ async function notificarTelegram(filas) {
   // se anota como visto y ahí se queda. Si una fila ya tenía mensaje publicado se
   // conserva su apunte tal cual —identificador y sala incluidos— para que al
   // reanudar se pueda seguir editando y moviendo en vez de duplicarla.
-  if (TG_PAUSA) {
+  if (TG_EN_PAUSA) {
     for (const fila of filas) {
       const sala = salaDe(fila);
       const previa = vigentes[fila.euvd] ?? null;
@@ -1412,6 +1429,58 @@ async function tomarCerrojo() {
   return false;
 }
 
+/**
+ * Deja fuera del feed lo que no toca publicar: lo anterior al corte y lo que ya
+ * ha cumplido sus VENTANA_DIAS. Se aplica al final, sobre las filas ya
+ * enriquecidas, y lo que descarta no llega ni a la web ni a Telegram: son la
+ * misma lista.
+ */
+function aplicarCorte(filas, ahora) {
+  const corte = Date.parse(CORTE);
+  if (Number.isNaN(corte)) {
+    if (CORTE) log(`AVISO: SYNC_DESDE no es una fecha ISO (${CORTE}); publico la ventana entera.`);
+    return filas;
+  }
+
+  // El catálogo de KEV fecha por días, no por horas: lo que entró hoy viene
+  // marcado a medianoche y quedaría por detrás de un corte puesto a media tarde.
+  // Para esas filas el corte es el día, no el instante.
+  const corteDia = Date.parse(soloFecha(new Date(corte)));
+  const caduca = ahora.getTime() - VENTANA_DIAS * 86400000;
+  let previas = 0;
+  let caducadas = 0;
+  let sinFecha = 0;
+
+  const publicables = filas.filter((fila) => {
+    // Las que trae el catálogo de KEV no se miden por cuándo se publicó la CVE
+    // —casi todas son de hace años— sino por cuándo entraron en el catálogo,
+    // que es lo que ahí es noticia. Y caducan igual que el resto: a los 14 días
+    // de entrar salen del feed, que es lo que impide que se vuelvan a acumular
+    // las ~1.700 de siempre.
+    if (fila.fueraDeVentana) {
+      const entrada = Date.parse(fila.kev?.fecha ?? "");
+      if (Number.isNaN(entrada)) return sinFecha++, false;
+      if (entrada < corteDia) return previas++, false;
+      if (entrada < caduca) return caducadas++, false;
+      return true;
+    }
+
+    // Para el resto la caducidad ya la pone la propia ventana de la descarga:
+    // lo que se pide a la EUVD son los últimos VENTANA_DIAS días y punto.
+    const publicada = Date.parse(fila.fecha ?? fila.actualizado ?? "");
+    if (Number.isNaN(publicada)) return sinFecha++, false;
+    if (publicada < corte) return previas++, false;
+    return true;
+  });
+
+  log(
+    `Corte en ${CORTE}: publico ${publicables.length} de ${filas.length} filas ` +
+      `(${previas} anteriores al corte, ${caducadas} de KEV pasadas de ${VENTANA_DIAS} días, ` +
+      `${sinFecha} sin fecha que mirar)`
+  );
+  return publicables;
+}
+
 // ---------------------------------------------------------------- descarga
 
 if (!(await tomarCerrojo())) {
@@ -1493,28 +1562,34 @@ await completarCwesNvd(filas);
 await completarEpss(filas);
 completarKev(filas, entradasKev);
 
+// Se filtra al final, con las filas ya enriquecidas: así el corte mira la fecha
+// de entrada en KEV, que la pone completarKev(). Lo que salga de aquí es lo que
+// se publica y lo único de lo que Telegram llega a enterarse.
+const publicables = aplicarCorte(filas, ahora);
+
 const salida = {
   generado: new Date().toISOString(),
   ventanaDias: VENTANA_DIAS,
+  corte: CORTE || null, // desde cuándo se acumula, si se arrancó en frío
   modo: RAPIDO ? "rapido" : "completo",
   desde,
   hasta,
-  total: filas.length,
+  total: publicables.length,
   totalEnEuvd: totalApi, // lo que la EUVD dice tener en la ventana, sin lo sembrado por KEV
-  fueraDeVentana: filas.filter((f) => f.fueraDeVentana).length,
+  fueraDeVentana: publicables.filter((f) => f.fueraDeVentana).length,
   fuente: "EU Vulnerability Database (ENISA)",
   fuenteScore: "EU Vulnerability Database (ENISA)",
   fuenteEpss: "EPSS de FIRST",
   fuenteKev: "CISA KEV y EU KEV, vía EUVD",
   fuenteCwe: "cve.org, con el NVD de respaldo",
-  items: filas,
+  items: publicables,
 };
 
 await escribirJson(destino, salida);
 
 log(
-  `Escritas ${filas.length} vulnerabilidades en ${destino} ` +
+  `Escritas ${publicables.length} vulnerabilidades en ${destino} ` +
     `(${RAPIDO ? "pasada rápida" : "pasada completa"})`
 );
 
-await notificarTelegram(filas);
+await notificarTelegram(publicables);

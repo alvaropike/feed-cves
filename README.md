@@ -482,6 +482,48 @@ Los avisos van **después** de escribir `cves.json` a propósito: que Telegram n
 puede dejar la web sin actualizar. Todo lo que pasa —lo enviado por sala, lo encolado, los
 errores— queda en el log de la ejecución.
 
+### El freno de mano
+
+`TELEGRAM_PAUSA=1` para Telegram sin parar el sync: la pasada descarga, enriquece y publica
+la web igual que siempre, pero no manda, no edita y no borra nada en el grupo. Va como
+**variable del repo** (Settings → Variables), no como secreto ni como constante, para poder
+ponerla y quitarla sin tocar el código ni esperar a un despliegue.
+
+Lo importante es lo que hace con lo que sale mientras está puesta: **lo anota en silencio**,
+como una siembra, en vez de encolarlo. Una pausa que guarda todo lo que no mandó es una bomba
+de relojería —al quitarla saldrían de golpe los avisos de todos los días que estuvo parada—,
+y de eso iba precisamente ponerla. Así que al reanudar solo llega lo que aparezca **a partir
+de ese momento**; lo de la pausa no se avisa nunca.
+
+Lo que ya estaba publicado conserva su apunte —sala e identificador de mensaje—, así que al
+reanudar se puede seguir editando y mudando en vez de duplicarlo.
+
+### Empezar de cero sin avalancha
+
+Borrar el feed no basta para empezar de cero: la pasada siguiente vuelve a pedir los 14 días
+a la EUVD, lo rellena entero y Telegram toma por novedad todo lo que no tenga anotado. Para
+eso está `SYNC_DESDE`, también variable del repo: una marca de tiempo ISO por debajo de la
+cual **nada entra en el feed**, ni en la web ni en Telegram, que son la misma lista.
+
+Con ella puesta, el feed arranca vacío y se va llenando con lo que vaya saliendo, hasta un
+máximo de `VENTANA_DIAS` (14) días:
+
+- **Lo de la ventana** entra por fecha de publicación y caduca solo porque la descarga deja
+  de pedirlo: lo que se pide son los últimos 14 días y punto.
+- **Lo del catálogo de KEV** entra por la fecha en que entró en el catálogo —que es lo que
+  ahí es noticia, no cuándo se publicó la CVE— y **caduca a los 14 días de entrar**. Es lo
+  que impide que se vuelvan a acumular las ~1.700 de siempre, casi todas de hace años. El
+  catálogo fecha por días, así que para estas el corte se compara por día: lo añadido hoy
+  entra aunque el corte se pusiera esta tarde.
+
+Es temporal por naturaleza: a los 14 días la ventana ya no alcanza al corte y deja de
+descartar nada, así que se puede borrar la variable y todo sigue igual. El precio, y solo
+durante esos 14 días, es que una vulnerabilidad que la EUVD publique con **fecha anterior**
+al corte no aparece —la EUVD rellena huecos hacia atrás—. Se prefiere eso a la avalancha.
+
+La marca queda en `cves.json` como `corte`, para saber desde cuándo se está acumulando, y
+cada pasada deja en el log cuántas filas descartó y por qué.
+
 ## Parámetros que querrás tocar
 
 En `euvd_sync.mjs` y `euvd_sync.php` (los nombres son equivalentes en ambos):
@@ -489,11 +531,16 @@ En `euvd_sync.mjs` y `euvd_sync.php` (los nombres son equivalentes en ambos):
 - `VENTANA_DIAS` — días hacia atrás. 14 da un volumen manejable; 30 engorda bastante el JSON.
   No afecta a lo que siembra el catálogo de KEV: eso entra por estar explotado, no por
   reciente, y sale marcado con `fueraDeVentana`.
-- `MAX_PAGINAS` — tope de seguridad. 60 páginas = 6.000 registros. **No lo bajes sin
+- `MAX_PAGINAS` — tope de seguridad. 100 páginas = 10.000 registros. **No lo bajes sin
   mirar el log**: si la ventana tiene más vulnerabilidades de las que caben, el sync avisa
   con un `AVISO:` y la web saca una banda, porque lo que se pierde no son las más antiguas
-  sino las que la API no llegue a devolver. Con 14 días son ~5.000, así que 25 páginas se
-  quedaban justo con la mitad.
+  sino las que la API no llegue a devolver. Con 14 días son ~6.000, así que 25 páginas se
+  quedaban con la cuarta parte y 60 se quedaron cortas el 2026-09-08. Y quedarse corto no es
+  solo publicar una web incompleta: **lo que falta hoy entra mañana como si acabara de
+  salir**, que fue lo que llenó la cola de Telegram con 900 avisos de vulnerabilidades de
+  hasta dos semanas.
+- `TELEGRAM_PAUSA` / `SYNC_DESDE` — variables de entorno, no constantes; ver "El freno de
+  mano" y "Empezar de cero sin avalancha".
 - `PAUSA_US` / `PAUSA_MS` — pausa entre peticiones. No lo bajes de 0,3 s.
 - `CONCURRENCIA_TITULOS` — peticiones simultáneas a cve.org. 6 va sobrado; subirlo
   arriesga que te empiecen a devolver 429.

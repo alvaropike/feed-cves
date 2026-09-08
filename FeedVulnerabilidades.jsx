@@ -769,10 +769,23 @@ export default function FeedVulnerabilidades() {
           </div>
         </header>
 
+        {/* Con un corte puesto el feed arranca vacío y se va llenando, así que se
+            dice desde cuándo: si no, unas pocas filas en una ventana de 14 días
+            parecen una descarga rota en vez de un feed recién empezado. */}
+        {datos?.corte && (
+          <div className="euvd-aviso">
+            Collecting from scratch since <b>{String(datos.corte).slice(0, 10)}</b>: only
+            vulnerabilities published after that show up here, and they drop off after{" "}
+            {datos?.ventanaDias ?? 14} days.
+          </div>
+        )}
+
         {/* `totalEnEuvd` es lo que la EUVD dice tener en la ventana, así que se
             compara con lo que vino de la ventana: sumarle lo sembrado por KEV
-            taparía el aviso justo cuando la paginación se estuviera quedando corta. */}
-        {datos?.totalEnEuvd > enVentana && (
+            taparía el aviso justo cuando la paginación se estuviera quedando corta.
+            Con un corte puesto la comparación no dice nada —sobran a propósito casi
+            todas—, así que el aviso se calla en vez de gritar cada pasada. */}
+        {!datos?.corte && datos?.totalEnEuvd > enVentana && (
           <div className="euvd-aviso">
             The EUVD lists <b>{datos.totalEnEuvd}</b> vulnerabilities in this window but the
             JSON only holds <b>{enVentana}</b>. Raise <code>MAX_PAGINAS</code> in the sync:
