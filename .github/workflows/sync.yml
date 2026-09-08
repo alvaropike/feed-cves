@@ -60,6 +60,69 @@ jobs:
           echo "modo=$modo" >> "$GITHUB_OUTPUT"
           echo "Pasada: $modo"
 
+      # Chivato de frescura. Las pasadas rápidas las dispara QStash cada 10 minutos;
+      # si deja de hacerlo —schedule borrado, PAT caducado, cuenta suspendida— no
+      # falla nada ni sale nada en rojo: simplemente no corre nadie. Lo único que
+      # lo delata es que la hora del JSON que sirve la web deja de moverse.
+      #
+      # Se mira antes de sincronizar, que es cuando ese dato es todavía el de la
+      # pasada anterior. Pide solo los primeros 200 bytes: "generado" es el primer
+      # campo del JSON, así que no hay que bajarse los 6 MB para saber la hora, y
+      # es la hora que estampó el sync, no la del fichero en el disco del hosting.
+      #
+      # Quien acaba dando la voz es la completa de cada 6 h: si QStash se cae, las
+      # rápidas no corren y por tanto tampoco comprueban nada. Seis horas de
+      # retraso en el aviso, frente a no enterarse nunca, que es lo que pasaba con
+      # el cron del hosting.
+      #
+      # Nunca falla el job: un chivato que tumba la pasada por no poder leer una
+      # cabecera hace más daño que el fallo que vigila.
+      - name: Comprobar que la web sigue fresca
+        env:
+          # Variable del repo (Settings → Variables), no secreto: es la URL pública
+          # del feed. Sin ella el chivato queda apagado y lo dice en el resumen.
+          SITIO_URL: ${{ vars.SITIO_URL }}
+          # Cuatro pasadas rápidas perdidas. Bastante margen para no avisar por un
+          # parpadeo del FTP, y bastante poco para enterarse el mismo día.
+          UMBRAL_MIN: 45
+          MODO: ${{ steps.modo.outputs.modo }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_AVISOS: ${{ secrets.TELEGRAM_CHAT_AVISOS }}
+          TELEGRAM_CHAT_KEV: ${{ secrets.TELEGRAM_CHAT_KEV }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$SITIO_URL" ]; then
+            echo "Sin la variable SITIO_URL: el chivato de frescura está apagado." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          url="${SITIO_URL%/}/data/cves.json"
+          # El ?t= es el mismo truco que usa la web: el .htaccess pone cinco
+          # minutos de caché y aquí interesa el fichero de verdad, no el del proxy.
+          cabeza=$(curl -sS --max-time 25 -r 0-200 -H 'Cache-Control: no-cache' \
+            "$url?t=$(date -u +%s)" 2>&1) || true
+          generado=$(printf '%s' "$cabeza" | sed -n 's/.*"generado":"\([^"]*\)".*/\1/p')
+
+          if [ -z "$generado" ]; then
+            echo "No he podido leer 'generado' de $url; me callo en vez de dar una falsa alarma."
+            # Pero sin dejarlo mudo: si esto empieza a salir en todas las pasadas,
+            # lo que está roto es el chivato y hay que verlo en el log.
+            [ -n "$cabeza" ] && echo "  lo que contestó: $cabeza"
+            exit 0
+          fi
+
+          edad=$(( ( $(date -u +%s) - $(date -u -d "$generado" +%s) ) / 60 ))
+          echo "Lo publicado se generó hace $edad min ($generado); el umbral está en $UMBRAL_MIN."
+          echo "Frescura al empezar: $edad min (umbral $UMBRAL_MIN)" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$edad" -gt "$UMBRAL_MIN" ]; then
+            aviso="⏳ <b>El feed lleva $edad min sin actualizarse</b>"
+            aviso="$aviso\nLo último se generó a las $generado, y las pasadas rápidas van cada 10 min."
+            aviso="$aviso\nMira el schedule de QStash y que el PAT siga vivo; esta pasada ($MODO) sigue su curso."
+            sh .github/avisar.sh "$(printf '%b' "$aviso")"
+          fi
+
       - name: Instalar lftp
         run: sudo apt-get update -qq && sudo apt-get install -y -qq lftp
 
@@ -195,3 +258,29 @@ jobs:
             const s = JSON.parse(require("fs").readFileSync("public/data/cves.json","utf8"));
             console.log("generado:", s.generado, "| modo:", s.modo, "| total:", s.total);
           ' >> "$GITHUB_STEP_SUMMARY"
+
+      # El fallo que importa no es el que sale en rojo en la pestaña de Actions:
+      # es el que nadie mira. GitHub manda un correo al dueño del repo cuando un
+      # workflow programado falla, pero no cuando lo lanza QStash por
+      # workflow_dispatch — que son 143 de las 144 pasadas del día. Sin esto, el
+      # FTP puede llevar caído desde ayer y el feed seguir enseñando la tabla de
+      # anteayer tan tranquilo, que es exactamente el fallo mudo del que se vino
+      # huyendo del cron del hosting.
+      #
+      # Va sin freno a propósito: si el hosting está caído dos horas, son doce
+      # avisos. Una alarma que se calla sola para no molestar no es una alarma, y
+      # el que quiera menos ruido tiene el remedio en arreglar lo que falla.
+      - name: Avisar si la pasada ha fallado
+        if: failure()
+        env:
+          MODO: ${{ steps.modo.outputs.modo }}
+          ENLACE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_AVISOS: ${{ secrets.TELEGRAM_CHAT_AVISOS }}
+          TELEGRAM_CHAT_KEV: ${{ secrets.TELEGRAM_CHAT_KEV }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          aviso="🔴 <b>La pasada $MODO ha fallado</b>"
+          aviso="$aviso\nLa web se queda con lo último que se publicó bien; no se ha perdido nada."
+          aviso="$aviso\n<a href=\"$ENLACE\">Ver el run</a>"
+          sh .github/avisar.sh "$(printf '%b' "$aviso")"

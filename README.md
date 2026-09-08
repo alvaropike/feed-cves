@@ -91,6 +91,11 @@ Los secretos van en Settings → Secrets and variables → Actions:
 | `NVD_API_KEY` | opcional; sube el límite del NVD de 5 a 50 peticiones/30 s |
 | `TELEGRAM_BOT_TOKEN` | opcional; sin él el sync corre igual y no avisa |
 | `TELEGRAM_CHAT_KEV`, `_CRITICAS`, `_ALTAS`, `_MEDIAS`, `_BAJAS`, `_SIN_PUNTUAR` | una sala por criticidad; ver "Avisos por Telegram" |
+| `TELEGRAM_CHAT_AVISOS` | opcional; sala de guardia para los fallos de la pasada, ver "Cuando algo se rompe" |
+
+Y una **variable** del repo (Settings → Variables), que no es un secreto porque es una URL
+pública: `SITIO_URL`, la raíz del feed publicado (`https://tu-subdominio.example/`). La usa
+el chivato de frescura; sin ella queda apagado y lo dice en el resumen del run.
 
 Las rutas del FTP son **relativas al directorio de entrada de la cuenta**, que debe ser el
 docroot. El primer paso del workflow hace `ls data` justamente para verificarlo: si algún
@@ -123,6 +128,31 @@ publica en tandas durante el horario laboral europeo, no continuamente.
 Dos avisos sobre el `schedule`. **Solo se ejecuta desde la rama por defecto**, así que en
 una rama no arranca. Y a 15 minutos salían ~5.800 min/mes: por encima de los 2.000 que da
 un repo privado, de ahí que este esté público — en repos públicos Actions es ilimitado.
+
+### Cuando algo se rompe
+
+Todo lo de arriba tiene una pega: **falla callándose**. Actions manda un correo cuando un
+workflow *programado* falla, pero no cuando lo lanza QStash por `workflow_dispatch`, que son
+143 de las 144 pasadas del día; y si QStash deja de disparar —schedule borrado, PAT caducado,
+cuenta suspendida— no falla nada en ninguna parte: simplemente no corre nadie. Las dos veces
+el resultado es el mismo que traía el cron del hosting, una web enseñando la tabla de
+anteayer tan tranquila. Así que hay dos chivatos, y los dos avisan por el bot que ya está
+montado:
+
+- **La pasada ha fallado.** Un paso con `if: failure()` al final del workflow manda a la sala
+  de guardia qué modo era y el enlace al run. No lleva freno: si el hosting está caído dos
+  horas son doce avisos, y es lo que tiene que pasar — una alarma que se calla sola para no
+  molestar no es una alarma.
+- **El feed lleva demasiado sin moverse.** Antes de sincronizar, el workflow pide los
+  primeros 200 bytes de `cves.json` a la web (`generado` es el primer campo del JSON, así que
+  no hay que bajarse los 6 MB) y compara la hora con el reloj. Si pasan de 45 minutos —cuatro
+  pasadas rápidas perdidas— avisa. Ojo a quién da la voz: si QStash se cae, las rápidas no
+  corren y por tanto tampoco comprueban nada, así que quien lo detecta es la completa de cada
+  6 h. Seis horas de retraso, frente a no enterarse nunca.
+
+Los dos salen con 0 pase lo que pase: un chivato que tumba la pasada por no poder leer una
+cabecera hace más daño que el fallo que vigila. Y sin `TELEGRAM_CHAT_AVISOS` el aviso cae en
+la sala de KEV, o en `TELEGRAM_CHAT_ID`, para que un montaje sin sala propia se entere igual.
 
 ## Dos cadencias: pasada rápida y pasada completa
 
@@ -235,7 +265,8 @@ al partirlos.
    (`-1001234567890`), y el menos forma parte del id.
 
 3. Dale al sync el token y las salas que hayas montado. En Actions son secretos del repo
-   (ver "Dónde corre el sync"); en local, un `.env` a partir de `.env.example`, o los
+   (ver "Dónde corre el sync"); en local, un `.env` a partir de `.env.example` —lo carga
+   `npm run sync` solo, con `--env-file-if-exists`, que pide Node 20.18 o más— o los
    `export` a mano.
 
    Si lo lanzas por cron en un hosting, mete los `export` en un `euvd_env.sh` con
