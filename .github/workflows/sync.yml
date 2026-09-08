@@ -94,7 +94,8 @@ jobs:
           EOF
 
       # Sin este paso, cada ejecución empezaría de cero: pediría los 5.000
-      # títulos a cve.org y Telegram re-sembraría sin avisar nunca de nada.
+      # títulos a cve.org, las ~1.300 fichas del catálogo de KEV, y Telegram
+      # re-sembraría sin avisar nunca de nada.
       #
       # Aquí sí se toleran las ausencias (fail-exit queda en no): la primera
       # vez no habrá .notificado.json, y eso es correcto, no un error.
@@ -114,6 +115,7 @@ jobs:
           mget -O public/data "data/cve_meta.json"
           mget -O public/data "data/cwes_nvd.json"
           mget -O public/data "data/epss.json"
+          mget -O public/data "data/kev_extra.json"
           get .notificado.json -o .notificado.json
           bye
           EOF
@@ -168,6 +170,7 @@ jobs:
           put public/data/cve_meta.json -o "data/cve_meta.json"
           put public/data/cwes_nvd.json -o "data/cwes_nvd.json"
           put public/data/epss.json     -o "data/epss.json"
+          put public/data/kev_extra.json -o "data/kev_extra.json"
           put .notificado.json          -o .notificado.json
           bye
           EOF

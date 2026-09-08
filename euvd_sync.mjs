@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 const API_SEARCH = "https://euvdservices.enisa.europa.eu/api/search";
 const API_CVE = "https://cveawg.mitre.org/api/cve/"; // registros oficiales de cve.org
 const API_KEV = "https://euvdservices.enisa.europa.eu/api/kev/dump"; // CISA KEV + EU KEV
+const API_ENISAID = "https://euvdservices.enisa.europa.eu/api/enisaid"; // ficha suelta, por id
 const VENTANA_DIAS = 14; // cuántos días hacia atrás pedir
 const PAGE_SIZE = 100; // máximo que admite la API
 // La ventana de 14 días ronda las 5.000 vulnerabilidades, así que 25 páginas se
@@ -99,6 +100,10 @@ const destino = join(AQUI, "public", "data", "cves.json");
 const cacheMeta = join(AQUI, "public", "data", "cve_meta.json"); // título y CWE de cve.org
 const cacheCwes = join(AQUI, "public", "data", "cwes_nvd.json");
 const cacheEpss = join(AQUI, "public", "data", "epss.json");
+// Las fichas de lo explotado que cae fuera de la ventana. Sin esta caché habría
+// que volver a pedir ~1.300 fichas sueltas en cada pasada; con ella solo se piden
+// las que entren nuevas en el catálogo, que son unas pocas por semana.
+const cacheKev = join(AQUI, "public", "data", "kev_extra.json");
 // Fuera de data/: ese directorio se publica y esto es estado interno, no un dato del feed.
 const estadoTelegram = join(AQUI, ".notificado.json");
 
@@ -498,20 +503,110 @@ async function completarEpss(filas) {
 // ---------------------------------------------------------------- KEV
 
 /**
- * Marca las filas que están en el catálogo de vulnerabilidades explotadas: CISA
- * KEV y EU KEV, que la EUVD consolida y sirve de una vez en `/api/kev/dump`.
+ * El catálogo de lo que ya se está explotando: CISA KEV y EU KEV, que la EUVD
+ * consolida y sirve de una vez en `/api/kev/dump`. Una sola petición, sin paginar.
  *
  * Es el complemento de la EPSS, no un duplicado: la EPSS estima la probabilidad
  * de que alguien la explote, el KEV dice que ya lo está haciendo. Y no se parecen
  * —de las que caen en KEV, la mayoría anda por debajo del 1 % de EPSS—, así que
- * ordenar por EPSS las entierra. Una sola petición, sin paginar.
+ * ordenar por EPSS las entierra.
+ *
+ * Se pide una vez por pasada y el resultado lo usan sembrarKev() y completarKev().
  */
-async function completarKev(filas) {
+async function pedirKev() {
   const dump = await pedir(API_KEV);
   const entradas = Array.isArray(dump) ? dump : dump?.items;
 
   if (!Array.isArray(entradas)) {
-    log("KEV: no pude leer el catálogo; las filas se quedan sin marcar.");
+    log("KEV: no pude leer el catálogo.");
+    return null;
+  }
+  return entradas;
+}
+
+/**
+ * Mete en el listado lo explotado que la ventana no alcanza.
+ *
+ * La búsqueda de la EUVD filtra por fecha de publicación, así que una CVE
+ * publicada en abril y explotada desde mayo no sale por ningún lado: ni en la web
+ * ni en la sala de KEV de Telegram, por muy grave que sea. Y eso es justo lo que
+ * no puede faltar, que es el único motivo por el que este feed pesa lo que pesa.
+ *
+ * completarKev() no servía para esto porque solo marca lo ya descargado; aquí se
+ * añaden filas, pidiendo la ficha suelta de cada una a `/api/enisaid`.
+ *
+ * El catálogo entero son ~1.300 entradas y casi ninguna cae en la ventana, así que
+ * las fichas se guardan en su propia caché y solo se piden las que aún no estén.
+ * En régimen son unas pocas por semana; la primera pasada sí paga las 1.300.
+ *
+ * La caché se poda con el catálogo, como las demás: lo que sale de KEV deja de
+ * mantenerse y de publicarse, que es lo correcto —si CISA lo retira, aquí también.
+ */
+async function sembrarKev(registros, entradas) {
+  if (!entradas) {
+    log("KEV: sin catálogo, no siembro nada fuera de ventana.");
+    return;
+  }
+
+  const cache = await leerCache(cacheKev);
+
+  // Lo que ya trajo la ventana no se vuelve a pedir, ni por su id de la EUVD ni
+  // por su CVE: la ficha sería la misma y la de la ventana viene más fresca.
+  const enVentana = new Set();
+  for (const fila of registros.values()) {
+    enVentana.add(fila.euvd);
+    if (fila.cve) enVentana.add(fila.cve);
+  }
+
+  const faltan = [];
+  for (const e of entradas) {
+    const euvd = typeof e?.euvdId === "string" ? e.euvdId : null;
+    if (!euvd || enVentana.has(euvd)) continue;
+    if (typeof e?.cveId === "string" && enVentana.has(e.cveId)) continue;
+    faltan.push(euvd);
+  }
+
+  const pendientes = faltan.filter((euvd) => !(euvd in cache));
+  log(
+    `KEV: ${faltan.length} explotadas fuera de la ventana, ` +
+      `${faltan.length - pendientes.length} en caché, ${pendientes.length} por pedir`
+  );
+
+  let hechas = 0;
+  for (const euvd of pendientes) {
+    const ficha = await pedir(API_ENISAID + "?" + new URLSearchParams({ id: euvd }));
+    const fila = ficha ? normalizar(ficha) : null;
+    // Los fallos no se cachean: se reintentan en la pasada siguiente, igual que
+    // en completarMeta(). Una ficha que no baja hoy baja dentro de diez minutos.
+    if (fila) cache[euvd] = fila;
+    if (++hechas % 50 === 0) log(`  ${hechas}/${pendientes.length} fichas de la EUVD`);
+    await dormir(PAUSA_MS);
+  }
+
+  // Poda: la caché se queda solo con lo que sigue en el catálogo.
+  const vigentes = {};
+  let sembradas = 0;
+  for (const euvd of faltan) {
+    const fila = cache[euvd];
+    if (!fila) continue;
+
+    vigentes[euvd] = fila;
+    // La marca es lo que distingue una fila traída por el catálogo de una traída
+    // por la ventana. La usa notificarTelegram() para no vaciar el catálogo
+    // entero en la sala de KEV la primera vez, y sale en el JSON porque es una
+    // diferencia real: esta fila está aquí por estar explotada, no por reciente.
+    registros.set(euvd, { ...fila, fueraDeVentana: true });
+    sembradas++;
+  }
+
+  await escribirJson(cacheKev, vigentes);
+  log(`KEV: ${sembradas} filas añadidas fuera de la ventana`);
+}
+
+/** Marca con la fecha y las fuentes del catálogo las filas que están en él. */
+function completarKev(filas, entradas) {
+  if (!entradas) {
+    log("KEV: sin catálogo, las filas se quedan sin marcar.");
     return;
   }
 
@@ -959,6 +1054,20 @@ async function notificarTelegram(filas) {
   const formatoViejo = Object.values(previas).some((v) => typeof v !== "object" || v === null);
   const primeraVez = typeof estado.sembrado !== "string";
 
+  // Sembrar el catálogo de KEV mete de golpe ~1.300 filas viejas que nunca se
+  // avisaron. Sin este marcador, la primera pasada tras el cambio intentaría
+  // volcarlas todas en la sala de KEV: a 3,5 s cada una son más de una hora de
+  // mensajes sobre cosas explotadas desde hace años, que no es una noticia.
+  // Se anotan calladas una vez y a partir de ahí solo llega lo que entre nuevo
+  // en el catálogo, que es el mismo trato que reciben las salas recién montadas.
+  const kevSinSembrar = typeof estado.sembradoKev !== "string";
+
+  // El marcador solo se pone si el catálogo llegó de verdad. Si la petición falló,
+  // `filas` no trae nada de fuera de ventana y darla por sembrada dejaría el
+  // volcado para la pasada siguiente, que es justo lo que se quiere evitar.
+  const hayFueraDeVentana = filas.some((f) => f.fueraDeVentana);
+  const marcaKev = (ahora) => estado.sembradoKev ?? (hayFueraDeVentana ? ahora : undefined);
+
   // La poda: nos quedamos con lo que sigue dentro de la ventana, como las demás
   // cachés, para que el fichero no crezca sin fin.
   const vigentes = {};
@@ -973,7 +1082,11 @@ async function notificarTelegram(filas) {
       vigentes[fila.euvd] = { sala, fecha: ahora, enviada: false, firma: firmaFila(fila, sala) };
     }
 
-    await escribirJson(estadoTelegram, { sembrado: estado.sembrado ?? ahora, avisadas: vigentes });
+    await escribirJson(estadoTelegram, {
+      sembrado: estado.sembrado ?? ahora,
+      sembradoKev: marcaKev(ahora),
+      avisadas: vigentes,
+    });
     log(
       `Telegram: ${primeraVez ? "primera ejecución" : "estado en formato antiguo"}, siembro ` +
         `${filas.length} vulnerabilidades sin avisar. A partir de la siguiente pasada solo llega lo nuevo.`
@@ -990,6 +1103,13 @@ async function notificarTelegram(filas) {
     const previa = vigentes[fila.euvd] ?? null;
     const firma = firmaFila(fila, sala);
     const destino = destinoDe(sala, fila);
+
+    // La siembra del catálogo: solo la primera vez y solo lo que entra por él.
+    // Lo que ya estaba anotado sigue su camino normal, incluidas las ediciones.
+    if (kevSinSembrar && fila.fueraDeVentana && !previa) {
+      vigentes[fila.euvd] = { sala, fecha: ahora, enviada: false, firma };
+      continue;
+    }
 
     // Ya anotada y sigue en su sala: como mucho, una edición silenciosa.
     if (previa && previa.sala === sala) {
@@ -1012,7 +1132,11 @@ async function notificarTelegram(filas) {
 
   if (envios.length === 0 && ediciones.length === 0) {
     log("Telegram: nada nuevo que avisar ni que actualizar.");
-    await escribirJson(estadoTelegram, { sembrado: estado.sembrado, avisadas: vigentes });
+    await escribirJson(estadoTelegram, {
+      sembrado: estado.sembrado,
+      sembradoKev: marcaKev(ahora),
+      avisadas: vigentes,
+    });
     return;
   }
 
@@ -1114,7 +1238,11 @@ async function notificarTelegram(filas) {
     }
   }
 
-  await escribirJson(estadoTelegram, { sembrado: estado.sembrado, avisadas: vigentes });
+  await escribirJson(estadoTelegram, {
+    sembrado: estado.sembrado,
+    sembradoKev: marcaKev(ahora),
+    avisadas: vigentes,
+  });
 
   const desglose = Object.entries(enviadas)
     .map(([sala, n]) => `${sala} ${n}`)
@@ -1242,6 +1370,13 @@ if (totalApi && registros.size < totalApi) {
 
 // ---------------------------------------------------------------- salida
 
+// El catálogo va antes de construir las filas, para que lo que siembre pase por
+// los mismos enriquecidos que lo demás: título de cve.org, CWE y EPSS. Las CWE
+// del NVD sí se las pierde —esas se piden por ventana de publicación—, pero la
+// fuente principal de CWE es cve.org y el NVD solo es el respaldo.
+const entradasKev = await pedirKev();
+await sembrarKev(registros, entradasKev);
+
 const filas = [...registros.values()].sort((a, b) =>
   String(b.fecha).localeCompare(String(a.fecha))
 ); // más recientes primero
@@ -1249,7 +1384,7 @@ const filas = [...registros.values()].sort((a, b) =>
 await completarMeta(filas);
 await completarCwesNvd(filas);
 await completarEpss(filas);
-await completarKev(filas);
+completarKev(filas, entradasKev);
 
 const salida = {
   generado: new Date().toISOString(),
@@ -1258,7 +1393,8 @@ const salida = {
   desde,
   hasta,
   total: filas.length,
-  totalEnEuvd: totalApi,
+  totalEnEuvd: totalApi, // lo que la EUVD dice tener en la ventana, sin lo sembrado por KEV
+  fueraDeVentana: filas.filter((f) => f.fueraDeVentana).length,
   fuente: "EU Vulnerability Database (ENISA)",
   fuenteScore: "EU Vulnerability Database (ENISA)",
   fuenteEpss: "EPSS de FIRST",

@@ -31,7 +31,8 @@ public_html/
 │   ├── cves.json       ← lo sube el workflow en cada pasada
 │   ├── cve_meta.json   ← caché de títulos y CWE de cve.org, también del workflow
 │   ├── cwes_nvd.json   ← caché de las CWE que añade el NVD, ídem
-│   └── epss.json       ← última EPSS conocida de FIRST, red por si la API cae
+│   ├── epss.json       ← última EPSS conocida de FIRST, red por si la API cae
+│   └── kev_extra.json  ← fichas de lo explotado que cae fuera de la ventana
 └── .notificado.json    ← qué se ha avisado ya por Telegram; fuera de data/, que se publica
 ```
 
@@ -134,8 +135,13 @@ ventana de ~4.900 vulnerabilidades, con las cachés ya calientes:
 | cve.org (solo las nuevas) | 1 s | 1 s |
 | CWE del NVD | **105 s** | de caché |
 | EPSS de FIRST | 30 s | de caché |
-| KEV | 1 s | 1 s |
+| KEV, catálogo | 1 s | 1 s |
+| KEV, fichas de fuera de ventana (solo las nuevas) | 1 s | 1 s |
 | **Total** | **190 s** | **35 s** |
+
+La primera pasada tras estrenar `kev_extra.json` es la excepción: hay que pedir las ~1.300
+fichas del catálogo una a una, unos 9 minutos. A partir de ahí solo se piden las que entren
+nuevas, que son unas pocas por semana.
 
 La pasada rápida (`--rapido`, o `SYNC_RAPIDO=1`) baja el listado, los títulos y CWE de lo
 nuevo y el KEV, y lee de `cwes_nvd.json` y `epss.json` en vez de preguntar. No se pierde
@@ -399,6 +405,8 @@ errores— queda en el log de la ejecución.
 En `euvd_sync.mjs` y `euvd_sync.php` (los nombres son equivalentes en ambos):
 
 - `VENTANA_DIAS` — días hacia atrás. 14 da un volumen manejable; 30 engorda bastante el JSON.
+  No afecta a lo que siembra el catálogo de KEV: eso entra por estar explotado, no por
+  reciente, y sale marcado con `fueraDeVentana`.
 - `MAX_PAGINAS` — tope de seguridad. 60 páginas = 6.000 registros. **No lo bajes sin
   mirar el log**: si la ventana tiene más vulnerabilidades de las que caben, el sync avisa
   con un `AVISO:` y la web saca una banda, porque lo que se pierde no son las más antiguas
@@ -413,7 +421,8 @@ En `euvd_sync.mjs` y `euvd_sync.php` (los nombres son equivalentes en ambos):
   NVD deja 5 peticiones cada 30 s; con ella, 50. Se pide gratis en
   <https://nvd.nist.gov/developers/request-an-api-key> Es el secreto `NVD_API_KEY` del repo.
 
-Con la ventana entera el JSON ronda los 6 MB, así que **sirve el `data/` con gzip**
+Con la ventana entera, más las ~1.300 que siembra el catálogo de KEV, el JSON ronda los
+7,5 MB, así que **sirve el `data/` con gzip**
 (`AddOutputFilterByType DEFLATE application/json` en el `.htaccess`); baja a ~1 MB. Si aun
 así se hace grande, lo siguiente es partirlo por días o acortar `VENTANA_DIAS`.
 
@@ -527,6 +536,31 @@ rojo, un distintivo "Explotada" junto al CVE y un chip de filtro propio en la ba
 
 Si el catálogo no responde, las filas se quedan sin marcar y el resto del sync sigue: es
 un dato que suma, no uno del que dependa la tabla.
+
+### El catálogo también trae filas, no solo marcas
+
+La búsqueda de la EUVD filtra por **fecha de publicación**, así que una CVE publicada en
+abril y explotada desde mayo no aparecía por ningún lado: ni en la web ni en la sala de KEV,
+por muy grave que fuera. Marcar no bastaba, porque solo se marca lo que ya se ha descargado.
+
+Así que el catálogo siembra: de cada entrada que no venga en la ventana se pide su ficha a
+`/api/enisaid?id=…` y se añade al listado, marcada con `fueraDeVentana: true`. Pasa por los
+mismos enriquecidos que el resto (título de cve.org, CWE, EPSS); las CWE del NVD sí se las
+pierde, porque esas se piden por ventana de publicación y cve.org es la fuente principal.
+
+Las fichas se guardan en `data/kev_extra.json` y la caché se poda con el catálogo: lo que
+CISA o la EUVD retiran deja de publicarse aquí también.
+
+El recuento de la cabecera lo dice separado ("N in the last 14 days + M older") y en el JSON
+está `fueraDeVentana` con cuántas son. `totalEnEuvd` sigue siendo lo que la EUVD dice tener
+en la ventana, sin lo sembrado: es con lo que se compara el aviso de paginación corta.
+
+En Telegram, la primera pasada con catálogo **anota las ~1.300 sin avisar** y deja la marca
+`sembradoKev` en `.notificado.json`. Sin eso, estrenar esto habría vaciado el catálogo entero
+en la sala de KEV: más de una hora de mensajes sobre cosas explotadas desde hace años. A
+partir de ahí sí llega lo que entre nuevo en el catálogo, que es el mismo trato que reciben
+las salas recién montadas. Si el catálogo falla en esa pasada, la marca no se pone y la
+siembra espera a la siguiente.
 
 ## El top por prioridad
 

@@ -26,6 +26,7 @@ declare(strict_types=1);
 const API_SEARCH = 'https://euvdservices.enisa.europa.eu/api/search';
 const API_CVE    = 'https://cveawg.mitre.org/api/cve/';  // registros oficiales de cve.org
 const API_KEV    = 'https://euvdservices.enisa.europa.eu/api/kev/dump';  // CISA KEV + EU KEV
+const API_ENISAID = 'https://euvdservices.enisa.europa.eu/api/enisaid';  // ficha suelta, por id
 const VENTANA_DIAS = 14;      // cuántos días hacia atrás pedir
 const PAGE_SIZE    = 100;     // máximo que admite la API
 // La ventana de 14 días ronda las 5.000 vulnerabilidades, así que 25 páginas se
@@ -103,6 +104,10 @@ $cerrojo_ruta = __DIR__ . '/.sync.lock';
 $cache_meta   = __DIR__ . '/data/cve_meta.json';   // título y CWE de cve.org
 $cache_cwes   = __DIR__ . '/data/cwes_nvd.json';
 $cache_epss   = __DIR__ . '/data/epss.json';
+// Las fichas de lo explotado que cae fuera de la ventana. Sin esta caché habría
+// que volver a pedir ~1.300 fichas sueltas en cada pasada; con ella solo se piden
+// las que entren nuevas en el catálogo, que son unas pocas por semana.
+$cache_kev    = __DIR__ . '/data/kev_extra.json';
 // Fuera de data/: ese directorio se publica y esto es estado interno, no un dato del feed.
 $estado_telegram = __DIR__ . '/.notificado.json';
 
@@ -651,17 +656,19 @@ function completar_epss(array &$filas, string $cache_ruta, bool $rapido): void
 // ---------------------------------------------------------------- KEV
 
 /**
- * Marca las filas que están en el catálogo de vulnerabilidades explotadas: CISA
- * KEV y EU KEV, que la EUVD consolida y sirve de una vez en /api/kev/dump.
+ * El catálogo de lo que ya se está explotando: CISA KEV y EU KEV, que la EUVD
+ * consolida y sirve de una vez en /api/kev/dump. Una sola petición, sin paginar.
  *
  * Es el complemento de la EPSS, no un duplicado: la EPSS estima la probabilidad
  * de que alguien la explote, el KEV dice que ya lo está haciendo. Y no se parecen
  * (de las que caen en KEV, la mayoría anda por debajo del 1 % de EPSS), así que
- * ordenar por EPSS las entierra. Una sola petición, sin paginar.
+ * ordenar por EPSS las entierra.
  *
- * @param array<int,array<string,mixed>> $filas
+ * Se pide una vez por pasada y el resultado lo usan sembrar_kev() y completar_kev().
+ *
+ * @return array<int,array<string,mixed>>|null
  */
-function completar_kev(array &$filas): void
+function pedir_kev(): ?array
 {
     $dump = pedir(API_KEV);
     $entradas = null;
@@ -670,7 +677,111 @@ function completar_kev(array &$filas): void
         $entradas = isset($dump[0]) ? $dump : ($dump['items'] ?? null);
     }
     if (!is_array($entradas)) {
-        log_linea('KEV: no pude leer el catálogo; las filas se quedan sin marcar.');
+        log_linea('KEV: no pude leer el catálogo.');
+        return null;
+    }
+    return $entradas;
+}
+
+/**
+ * Mete en el listado lo explotado que la ventana no alcanza.
+ *
+ * La búsqueda de la EUVD filtra por fecha de publicación, así que una CVE
+ * publicada en abril y explotada desde mayo no sale por ningún lado: ni en la web
+ * ni en la sala de KEV de Telegram, por muy grave que sea. Y eso es justo lo que
+ * no puede faltar, que es el único motivo por el que este feed pesa lo que pesa.
+ *
+ * completar_kev() no servía para esto porque solo marca lo ya descargado; aquí se
+ * añaden filas, pidiendo la ficha suelta de cada una a /api/enisaid.
+ *
+ * El catálogo entero son ~1.300 entradas y casi ninguna cae en la ventana, así que
+ * las fichas se guardan en su propia caché y solo se piden las que aún no estén.
+ * En régimen son unas pocas por semana; la primera pasada sí paga las 1.300.
+ *
+ * La caché se poda con el catálogo, como las demás: lo que sale de KEV deja de
+ * mantenerse y de publicarse, que es lo correcto (si CISA lo retira, aquí también).
+ *
+ * @param array<string,array<string,mixed>>      $registros
+ * @param array<int,array<string,mixed>>|null    $entradas
+ */
+function sembrar_kev(array &$registros, ?array $entradas, string $cache_ruta): void
+{
+    if ($entradas === null) {
+        log_linea('KEV: sin catálogo, no siembro nada fuera de ventana.');
+        return;
+    }
+
+    $cache = leer_cache($cache_ruta);
+
+    // Lo que ya trajo la ventana no se vuelve a pedir, ni por su id de la EUVD ni
+    // por su CVE: la ficha sería la misma y la de la ventana viene más fresca.
+    $en_ventana = [];
+    foreach ($registros as $fila) {
+        $en_ventana[$fila['euvd']] = true;
+        if (is_string($fila['cve'] ?? null)) $en_ventana[$fila['cve']] = true;
+    }
+
+    $faltan = [];
+    foreach ($entradas as $e) {
+        $euvd = $e['euvdId'] ?? null;
+        if (!is_string($euvd) || isset($en_ventana[$euvd])) continue;
+
+        $cve = $e['cveId'] ?? null;
+        if (is_string($cve) && isset($en_ventana[$cve])) continue;
+
+        $faltan[] = $euvd;
+    }
+
+    $pendientes = [];
+    foreach ($faltan as $euvd) {
+        if (!isset($cache[$euvd])) $pendientes[] = $euvd;
+    }
+
+    log_linea('KEV: ' . count($faltan) . ' explotadas fuera de la ventana, '
+        . (count($faltan) - count($pendientes)) . ' en caché, ' . count($pendientes) . ' por pedir');
+
+    $hechas = 0;
+    foreach ($pendientes as $euvd) {
+        $ficha = pedir(API_ENISAID . '?' . http_build_query(['id' => $euvd]));
+        $fila  = is_array($ficha) ? normalizar($ficha) : null;
+        // Los fallos no se cachean: se reintentan en la pasada siguiente, igual que
+        // en completar_meta(). Una ficha que no baja hoy baja dentro de diez minutos.
+        if ($fila !== null) $cache[$euvd] = $fila;
+        if (++$hechas % 50 === 0) log_linea('  ' . $hechas . '/' . count($pendientes) . ' fichas de la EUVD');
+        usleep(PAUSA_US);
+    }
+
+    // Poda: la caché se queda solo con lo que sigue en el catálogo.
+    $vigentes = [];
+    $sembradas = 0;
+    foreach ($faltan as $euvd) {
+        $fila = $cache[$euvd] ?? null;
+        if (!is_array($fila)) continue;
+
+        $vigentes[$euvd] = $fila;
+        // La marca es lo que distingue una fila traída por el catálogo de una traída
+        // por la ventana. La usa notificar_telegram() para no vaciar el catálogo
+        // entero en la sala de KEV la primera vez, y sale en el JSON porque es una
+        // diferencia real: esta fila está aquí por estar explotada, no por reciente.
+        $fila['fueraDeVentana'] = true;
+        $registros[$euvd] = $fila;
+        $sembradas++;
+    }
+
+    escribir_json($cache_ruta, $vigentes);
+    log_linea('KEV: ' . $sembradas . ' filas añadidas fuera de la ventana');
+}
+
+/**
+ * Marca con la fecha y las fuentes del catálogo las filas que están en él.
+ *
+ * @param array<int,array<string,mixed>>      $filas
+ * @param array<int,array<string,mixed>>|null $entradas
+ */
+function completar_kev(array &$filas, ?array $entradas): void
+{
+    if ($entradas === null) {
+        log_linea('KEV: sin catálogo, las filas se quedan sin marcar.');
         return;
     }
 
@@ -1264,6 +1375,25 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
     }
     $primera_vez = !is_string($estado['sembrado'] ?? null);
 
+    // Sembrar el catálogo de KEV mete de golpe ~1.300 filas viejas que nunca se
+    // avisaron. Sin este marcador, la primera pasada tras el cambio intentaría
+    // volcarlas todas en la sala de KEV: a 3,5 s cada una son más de una hora de
+    // mensajes sobre cosas explotadas desde hace años, que no es una noticia.
+    // Se anotan calladas una vez y a partir de ahí solo llega lo que entre nuevo
+    // en el catálogo, que es el mismo trato que reciben las salas recién montadas.
+    $kev_sin_sembrar = !is_string($estado['sembradoKev'] ?? null);
+
+    // El marcador solo se pone si el catálogo llegó de verdad. Si la petición falló,
+    // $filas no trae nada de fuera de ventana y darla por sembrada dejaría el
+    // volcado para la pasada siguiente, que es justo lo que se quiere evitar.
+    $hay_fuera_de_ventana = false;
+    foreach ($filas as $fila) {
+        if (($fila['fueraDeVentana'] ?? false) === true) {
+            $hay_fuera_de_ventana = true;
+            break;
+        }
+    }
+
     // La poda: nos quedamos con lo que sigue dentro de la ventana, como las demás
     // cachés, para que el fichero no crezca sin fin.
     $vigentes = [];
@@ -1275,6 +1405,16 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
 
     $ahora = gmdate('c');
 
+    // Igual que en el .mjs: si no hay marcador y tampoco hay nada sembrado, la
+    // clave se omite y el marcador queda para la pasada que sí traiga catálogo.
+    $marca_kev = is_string($estado['sembradoKev'] ?? null)
+        ? $estado['sembradoKev']
+        : ($hay_fuera_de_ventana ? $ahora : null);
+    $estado_base = ['sembradoKev' => $marca_kev];
+    if ($marca_kev === null) {
+        unset($estado_base['sembradoKev']);
+    }
+
     if ($primera_vez || $formato_viejo) {
         foreach ($filas as $fila) {
             $sala = sala_de($fila);
@@ -1285,7 +1425,7 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
                 'firma'   => firma_fila($fila, $sala),
             ];
         }
-        escribir_json($estado_ruta, [
+        escribir_json($estado_ruta, $estado_base + [
             'sembrado' => is_string($estado['sembrado'] ?? null) ? $estado['sembrado'] : $ahora,
             'avisadas' => $vigentes,
         ]);
@@ -1303,6 +1443,15 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
         $previa  = $vigentes[$fila['euvd']] ?? null;
         $firma   = firma_fila($fila, $sala);
         $destino = destino_de($sala, $fila, $salas, $respaldo, $umbral);
+
+        // La siembra del catálogo: solo la primera vez y solo lo que entra por él.
+        // Lo que ya estaba anotado sigue su camino normal, incluidas las ediciones.
+        if ($kev_sin_sembrar && ($fila['fueraDeVentana'] ?? false) === true && $previa === null) {
+            $vigentes[$fila['euvd']] = [
+                'sala' => $sala, 'fecha' => $ahora, 'enviada' => false, 'firma' => $firma,
+            ];
+            continue;
+        }
 
         // Ya anotada y sigue en su sala: como mucho, una edición silenciosa.
         if ($previa !== null && (string) ($previa['sala'] ?? '') === $sala) {
@@ -1342,7 +1491,7 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
 
     if (count($envios) === 0 && count($ediciones) === 0) {
         log_linea('Telegram: nada nuevo que avisar ni que actualizar.');
-        escribir_json($estado_ruta, ['sembrado' => $estado['sembrado'], 'avisadas' => $vigentes]);
+        escribir_json($estado_ruta, $estado_base + ['sembrado' => $estado['sembrado'], 'avisadas' => $vigentes]);
         return;
     }
 
@@ -1478,7 +1627,7 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
         }
     }
 
-    escribir_json($estado_ruta, ['sembrado' => $estado['sembrado'], 'avisadas' => $vigentes]);
+    escribir_json($estado_ruta, $estado_base + ['sembrado' => $estado['sembrado'], 'avisadas' => $vigentes]);
 
     $desglose = [];
     foreach ($enviadas as $sala => $n) {
@@ -1573,6 +1722,13 @@ if ($total_api && count($registros) < (int) $total_api) {
 
 // ---------------------------------------------------------------- salida
 
+// El catálogo va antes de construir las filas, para que lo que siembre pase por
+// los mismos enriquecidos que lo demás: título de cve.org, CWE y EPSS. Las CWE
+// del NVD sí se las pierde (esas se piden por ventana de publicación), pero la
+// fuente principal de CWE es cve.org y el NVD solo es el respaldo.
+$entradas_kev = pedir_kev();
+sembrar_kev($registros, $entradas_kev, $cache_kev);
+
 $filas = array_values($registros);
 
 usort($filas, static function (array $a, array $b): int {
@@ -1582,7 +1738,7 @@ usort($filas, static function (array $a, array $b): int {
 completar_meta($filas, $cache_meta);
 completar_cwes_nvd($filas, $cache_cwes, $nvd_clave, $nvd_pausa_us, $rapido);
 completar_epss($filas, $cache_epss, $rapido);
-completar_kev($filas);
+completar_kev($filas, $entradas_kev);
 
 $salida = [
     'generado'      => gmdate('c'),
@@ -1591,7 +1747,12 @@ $salida = [
     'desde'         => $desde,
     'hasta'         => $hasta,
     'total'         => count($filas),
+    // Lo que la EUVD dice tener en la ventana, sin lo sembrado por KEV.
     'totalEnEuvd'   => $total_api,
+    'fueraDeVentana' => count(array_filter(
+        $filas,
+        static fn (array $f): bool => ($f['fueraDeVentana'] ?? false) === true
+    )),
     'fuente'        => 'EU Vulnerability Database (ENISA)',
     'fuenteScore'   => 'EU Vulnerability Database (ENISA)',
     'fuenteEpss'    => 'EPSS de FIRST',

@@ -588,6 +588,12 @@ export default function FeedVulnerabilidades() {
 
   const enKev = useMemo(() => items.filter((v) => v.kev).length, [items]);
 
+  // Las que están por explotadas y no por recientes: el sync las trae del catálogo
+  // de KEV aunque su publicación quede fuera de la ventana. Se cuentan aparte
+  // porque el recuento de arriba dice "en los últimos N días" y estas no lo están.
+  const fueraDeVentana = useMemo(() => items.filter((v) => v.fueraDeVentana).length, [items]);
+  const enVentana = items.length - fueraDeVentana;
+
   const top = useMemo(() => [...items].sort(porPrioridad).slice(0, TOP_N), [items]);
 
   const filtradas = useMemo(() => {
@@ -750,7 +756,8 @@ export default function FeedVulnerabilidades() {
             <div className="euvd-recuento">
               <span className="euvd-cifra">{items.length}</span>
               <span className="euvd-cifra-pie">
-                in the last {datos?.ventanaDias ?? 14} days
+                {enVentana} in the last {datos?.ventanaDias ?? 14} days
+                {fueraDeVentana > 0 && <> {"+ "}{fueraDeVentana} older</>}
                 {enKev > 0 && (
                   <>
                     {" · "}
@@ -762,10 +769,13 @@ export default function FeedVulnerabilidades() {
           </div>
         </header>
 
-        {datos?.totalEnEuvd > items.length && (
+        {/* `totalEnEuvd` es lo que la EUVD dice tener en la ventana, así que se
+            compara con lo que vino de la ventana: sumarle lo sembrado por KEV
+            taparía el aviso justo cuando la paginación se estuviera quedando corta. */}
+        {datos?.totalEnEuvd > enVentana && (
           <div className="euvd-aviso">
             The EUVD lists <b>{datos.totalEnEuvd}</b> vulnerabilities in this window but the
-            JSON only holds <b>{items.length}</b>. Raise <code>MAX_PAGINAS</code> in the sync:
+            JSON only holds <b>{enVentana}</b>. Raise <code>MAX_PAGINAS</code> in the sync:
             what is missing is not the oldest ones, it is whatever the API did not return.
           </div>
         )}
