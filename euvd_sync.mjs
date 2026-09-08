@@ -1095,7 +1095,7 @@ async function telegramBorrar(chat, mensaje) {
  * Va después de escribir el JSON a propósito: que Telegram no conteste no puede
  * dejar la web sin actualizar.
  */
-async function notificarTelegram(filas) {
+async function notificarTelegram(filas, registroSembrado = null) {
   const salasConfiguradas = Object.values(TG_SALAS).filter(Boolean).length;
 
   if (!TG_TOKEN || (!TG_CHAT && salasConfiguradas === 0)) {
@@ -1123,7 +1123,11 @@ async function notificarTelegram(filas) {
   // mensajes sobre cosas explotadas desde hace años, que no es una noticia.
   // Se anotan calladas una vez y a partir de ahí solo llega lo que entre nuevo
   // en el catálogo, que es el mismo trato que reciben las salas recién montadas.
-  const kevSinSembrar = typeof estado.sembradoKev !== "string";
+  // Con la memoria del feed sembrada, este marcador sobra y además estorba: a
+  // Telegram ya solo le llega lo que .vistas.json da por nuevo, así que un volcado
+  // del catálogo es imposible, y silenciar el primer KEV nuevo sería perder justo
+  // el aviso que más importa. La red sigue existiendo para un montaje sin registro.
+  const kevSinSembrar = typeof estado.sembradoKev !== "string" && !registroSembrado;
 
   // El marcador solo se pone si el catálogo llegó de verdad. Si la petición falló,
   // `filas` no trae nada de fuera de ventana y darla por sembrada dejaría el
@@ -1636,4 +1640,4 @@ log(
     `(${RAPIDO ? "pasada rápida" : "pasada completa"})`
 );
 
-await notificarTelegram(publicables);
+await notificarTelegram(publicables, registro.sembrado ?? null);

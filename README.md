@@ -449,6 +449,11 @@ entraron en el catálogo hace menos de `TG_DIAS_NOTICIA` (7 días). Una CVE de 2
 añade hoy sí importa; la misma añadida en 2022, no. Aunque se pierda el estado entero, lo
 viejo no vuelve a la sala.
 
+El marcador `sembradoKev`, que anotaba el catálogo entero en silencio la primera vez, **solo
+actúa si no hay registro de vistas**. Con `.vistas.json` sembrado el volcado ya es imposible
+—a Telegram solo le llega lo que el registro da por nuevo— y callarse el primer KEV nuevo
+sería perder el aviso que más importa. La red se queda para un montaje sin registro.
+
 El filtro solo decide el **primer** aviso. Una fila ya anotada sigue su camino por vieja que
 sea: si cambia se edita en el sitio, y si cambia de sala se muda a la que le toque.
 

@@ -1417,7 +1417,7 @@ function telegram_borrar(string $token, string $chat, int $mensaje): array
  * @param array<int,array<string,mixed>> $filas
  * @param array<string,string>           $salas
  */
-function notificar_telegram(array $filas, string $token, array $salas, string $respaldo, float $umbral, string $estado_ruta): void
+function notificar_telegram(array $filas, string $token, array $salas, string $respaldo, float $umbral, string $estado_ruta, ?string $registro_sembrado = null): void
 {
     $configuradas = count(array_filter($salas));
 
@@ -1452,7 +1452,11 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
     // mensajes sobre cosas explotadas desde hace años, que no es una noticia.
     // Se anotan calladas una vez y a partir de ahí solo llega lo que entre nuevo
     // en el catálogo, que es el mismo trato que reciben las salas recién montadas.
-    $kev_sin_sembrar = !is_string($estado['sembradoKev'] ?? null);
+    // Con la memoria del feed sembrada, este marcador sobra y además estorba: a
+    // Telegram ya solo le llega lo que .vistas.json da por nuevo, así que un volcado
+    // del catálogo es imposible, y silenciar el primer KEV nuevo sería perder justo
+    // el aviso que más importa. La red sigue existiendo para un montaje sin registro.
+    $kev_sin_sembrar = !is_string($estado['sembradoKev'] ?? null) && $registro_sembrado === null;
 
     // El marcador solo se pone si el catálogo llegó de verdad. Si la petición falló,
     // $filas no trae nada de fuera de ventana y darla por sembrada dejaría el
@@ -2033,4 +2037,5 @@ if (!escribir_json($destino, $salida)) {
 log_linea('Escritas ' . count($publicables) . ' vulnerabilidades en ' . $destino
     . ' (' . ($rapido ? 'pasada rápida' : 'pasada completa') . ')');
 
-notificar_telegram($publicables, $tg_token, $tg_salas, $tg_chat, $tg_umbral, $estado_telegram);
+notificar_telegram($publicables, $tg_token, $tg_salas, $tg_chat, $tg_umbral, $estado_telegram,
+    $registro['sembrado'] ?? null);
