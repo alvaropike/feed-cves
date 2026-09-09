@@ -32,11 +32,6 @@ const API_ENISAID = "https://euvdservices.enisa.europa.eu/api/enisaid"; // ficha
 // igual: la web sale como siempre, con la marca de CISA y EU KEV, y Telegram
 // no manda nada, que es lo correcto — sin catálogo no se sabe qué avisar.
 const API_VULNCHECK_KEV = "https://api.vulncheck.com/v3/index/vulncheck-kev";
-// El NVD servido por VulnCheck. El catálogo de KEV trae el nombre, el fabricante,
-// el producto y las CWE, pero no la puntuación ni la fecha de publicación, y el
-// mensaje de Telegram las lleva. Se pide por CVE y solo de lo que se va a mandar
-// —unos pocos por pasada—, así que no hace falta ni paginar ni cachear en disco.
-const API_VULNCHECK_NVD = "https://api.vulncheck.com/v3/index/nist-nvd2";
 const VULNCHECK_TOKEN = process.env.VULNCHECK_API_TOKEN ?? "";
 const VULNCHECK_PAGE = 1000; // el máximo que sirve de una vez
 // El tier community corta la paginación en 6 páginas: 6.000 entradas, de sobra
@@ -681,75 +676,6 @@ function fichaVulncheck(e) {
 }
 
 /**
- * La puntuación, el vector, las CWE y la fecha de publicación de un CVE, del NVD
- * que sirve el propio VulnCheck. Es lo único del mensaje que el catálogo de KEV
- * no trae, y se pide de una en una porque solo hace falta para lo que se manda:
- * con el filtro puesto son unos pocos por pasada, muy lejos de las 1.000
- * peticiones por minuto que deja el tier community.
- */
-async function pedirVulncheckNvd(cve) {
-  const url = API_VULNCHECK_NVD + "?" + new URLSearchParams({ cve });
-  const respuesta = await pedir(url, { Authorization: `Bearer ${VULNCHECK_TOKEN}` });
-  const ficha = Array.isArray(respuesta?.data) ? respuesta.data[0] : null;
-  if (!ficha) return null;
-
-  // De las métricas manda la versión más alta que traiga, y a igualdad la del
-  // asignador: es el mismo criterio con el que el NVD enseña una sola.
-  let mejor = null;
-  for (const [clave, lista] of Object.entries(ficha.metrics ?? {})) {
-    if (!clave.startsWith("cvssMetric") || !Array.isArray(lista)) continue;
-    for (const m of lista) {
-      const d = m?.cvssData;
-      const score = Number(d?.baseScore);
-      if (!Number.isFinite(score)) continue;
-
-      const version = Number.parseFloat(d.version ?? "0") || 0;
-      const primaria = m?.type === "Primary";
-      if (mejor && !(version > mejor.version || (version === mejor.version && primaria && !mejor.primaria))) continue;
-
-      // Los dos subíndices cuelgan de la métrica, no de cvssData, y se cogen de
-      // la misma que da el score: mezclarlos con los de otra sería sumar peras
-      // y manzanas. El CVSS 4.0 no los tiene, así que ahí se quedan en null.
-      mejor = {
-        version,
-        primaria,
-        score,
-        vector: typeof d.vectorString === "string" ? d.vectorString : null,
-        explotabilidad: Number.isFinite(Number(m?.exploitabilityScore)) ? Number(m.exploitabilityScore) : null,
-        impacto: Number.isFinite(Number(m?.impactScore)) ? Number(m.impactScore) : null,
-      };
-    }
-  }
-
-  const cwes = (Array.isArray(ficha.weaknesses) ? ficha.weaknesses : [])
-    .flatMap((w) => (Array.isArray(w?.description) ? w.description : []))
-    .map((d) => d?.value)
-    .filter((v) => typeof v === "string" && /^CWE-\d+$/.test(v));
-
-  return {
-    score: mejor?.score ?? null,
-    cvss: mejor ? String(mejor.version) : null,
-    vector: mejor?.vector ?? null,
-    explotabilidad: mejor?.explotabilidad ?? null,
-    impacto: mejor?.impacto ?? null,
-    // Sin recortar: el mensaje enseña también la hora. El NVD la publica en UTC
-    // y sin marca horaria, que es justo por lo que el mensaje lo dice.
-    publicado: typeof ficha.published === "string" ? ficha.published : null,
-    cwes: [...new Set(cwes)],
-  };
-}
-
-// Una sola petición por CVE y pasada: entre un envío y la edición del mismo
-// mensaje no hace falta volver a preguntar.
-const nvdVistas = new Map();
-
-async function datosVulncheckNvd(cve) {
-  if (typeof cve !== "string" || cve === "") return null;
-  if (!nvdVistas.has(cve)) nvdVistas.set(cve, await pedirVulncheckNvd(cve));
-  return nvdVistas.get(cve);
-}
-
-/**
  * Mete en el listado lo explotado que la ventana no alcanza.
  *
  * La búsqueda de la EUVD filtra por fecha de publicación, así que una CVE
@@ -1116,14 +1042,6 @@ const TG_ETIQUETA_SALA = {
   sin_puntuar: "Unscored",
 };
 
-const TG_MARCA = {
-  critica: "\u{1F534} CRITICAL",
-  alta: "\u{1F7E0} HIGH",
-  media: "\u{1F7E1} MEDIUM",
-  baja: "\u{1F535} LOW",
-  sin_puntuar: "\u{26AA} UNSCORED",
-};
-
 // La descripción va en una cita: por encima de TG_DESC_PLEGABLE, Telegram la
 // pliega y deja el resto del mensaje a la vista. El tope duro existe porque hay
 // descripciones de 4.000 caracteres y un mensaje entero no puede pasar de 4.096.
@@ -1131,16 +1049,6 @@ const TG_DESC_PLEGABLE = 300;
 const TG_DESC_MAX = 3000;
 
 const TG_CWE_VISIBLES = 3; // el mismo tope que la tabla; el resto va como "+n"
-
-// A cuánto llega cada subíndice, que es lo que los hace legibles: un 1.8 de
-// explotabilidad no dice nada, un "1.8 / 3.9" dice que cuesta explotarla. Los
-// topes no son los mismos en cada versión del CVSS —la 2.0 puntúa los dos sobre
-// 10— y la 4.0 no publica subíndices, así que ahí no sale la línea.
-const TG_CVSS_TOPES = {
-  "2.0": { explotabilidad: 10, impacto: 10 },
-  "3.0": { explotabilidad: 3.9, impacto: 6 },
-  "3.1": { explotabilidad: 3.9, impacto: 6 },
-};
 
 // La acción recomendada es plantilla —19 textos distintos para 1.000 entradas—
 // pero las hay de 520 caracteres. El tope está para que una futura más larga no
@@ -1158,14 +1066,15 @@ const TG_EVIDENCIAS_VISIBLES = 2;
  * la notificación del móvil (criticidad, puntuación e identificador), título,
  * la alerta de explotación, los datos etiquetados y los enlaces.
  *
- * **Todo lo que dice sale de VulnCheck**: `vc` es su ficha del catálogo de KEV
- * —nombre, descripción, fabricante, producto, CWE, fechas, ransomware, plazo y
- * pruebas de explotación— y `nvd` es la puntuación y la fecha de publicación,
- * del NVD que sirve el propio VulnCheck. La fila solo pone el identificador.
+ * **Todo lo que dice sale del catálogo de KEV de VulnCheck**: `vc` es su ficha
+ * —nombre, descripción, fabricante, producto, CWE, fechas, ransomware, plazo,
+ * acción recomendada y referencias—. La fila solo pone el identificador.
  *
- * Eso deja fuera la EPSS, que la sirve FIRST y VulnCheck no: en un mensaje que
- * solo sale de lo ya explotado tampoco pintaba mucho una probabilidad de que
- * llegue a explotarse. La tabla la sigue enseñando.
+ * Y solo de ahí: ni EPSS de FIRST ni nada del NVD. Eso deja el mensaje sin CVSS,
+ * sin subíndices y sin fecha de publicación, y sin CWE en las dos terceras partes
+ * del catálogo que no las traen. A cambio no depende de una fuente que va por
+ * detrás: de las CVE recién metidas en KEV, el NVD tiene menos de la mitad
+ * analizadas. La tabla de la web sí sigue enseñando todo eso.
  *
  * El identificador va en <code> para que Telegram lo ponga en monoespaciada y
  * se pueda copiar tocándolo, que es lo primero que se hace con un CVE.
@@ -1178,7 +1087,7 @@ const TG_EVIDENCIAS_VISIBLES = 2;
  * eso un mensaje cambiaría de contenido sin que se note: Telegram no marca de
  * ninguna manera los mensajes que edita un bot.
  */
-function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado = null) {
+function mensajeTelegram(fila, vc = null, previa = null, actualizado = null) {
   const lineas = [];
 
   if (previa) {
@@ -1193,14 +1102,12 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
     lineas.push(`${marca} — previously reported as ${antes}${cuando}`, "");
   }
 
-  // El score del NVD que sirve VulnCheck; la severidad, del mismo corte que usa
-  // la tabla, para que la marca de la cabecera diga lo mismo que el número.
-  const score = typeof nvd?.score === "number" ? nvd.score : null;
-  const marca = TG_MARCA[severidad(score)] ?? TG_MARCA.sin_puntuar;
-  // Sin puntuación la cabecera se queda con la marca a secas: un CVSS 0.0 que
-  // nadie ha puesto sería peor que no decir nada.
-  const puntuacion = score > 0 ? ` · CVSS <b>${score.toFixed(1)}</b>` : "";
-  lineas.push(`${marca}${puntuacion} · <code>${escaparHtml(fila.cve ?? fila.euvd)}</code>`);
+  // Sin CVSS, la cabecera es el identificador y el punto rojo. No hay marca de
+  // severidad porque no hay de dónde sacarla, y poner "UNSCORED" en todos los
+  // mensajes sería peor que no poner nada: diría que no está puntuada, cuando lo
+  // que pasa es que aquí no se mira. El rojo es constante a propósito — todo lo
+  // que llega a esta sala se está explotando.
+  lineas.push(`\u{1F534} <code>${escaparHtml(fila.cve ?? fila.euvd)}</code>`);
 
   // La descripción trae saltos de línea a media frase, así que se normaliza.
   const descripcion = String(vc?.descripcion ?? "").replace(/\s+/g, " ").trim();
@@ -1238,7 +1145,6 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
   // ojo no encuentra dónde mirar; en tres tandas de dos o tres, sí. Cada dato se
   // calla si no lo hay, y un bloque entero desaparece si se quedan todos callados.
   const identidad = [];
-  const medidas = [];
   const fechas = [];
 
   if (vc?.vendor) identidad.push(`<b>Vendor:</b> ${escaparHtml(vc.vendor)}`);
@@ -1250,9 +1156,9 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
   // visibles y un "+n" con el resto: en un mensaje de móvil, seis identificadores
   // seguidos ocupan más que todo lo demás junto.
   //
-  // Manda las del catálogo de KEV, que van a la causa de lo que se está
-  // explotando; las del NVD entran solo si el catálogo no trae ninguna.
-  const cwes = (vc?.cwes?.length ? vc.cwes : (nvd?.cwes ?? [])).filter((id) => /^CWE-\d+$/.test(id));
+  // Solo las del catálogo, que las trae una de cada tres entradas. Las otras dos
+  // se quedan sin la línea: la alternativa era pedírselas al NVD.
+  const cwes = (vc?.cwes ?? []).filter((id) => /^CWE-\d+$/.test(id));
   if (cwes.length) {
     const enlazadas = cwes
       .slice(0, TG_CWE_VISIBLES)
@@ -1262,34 +1168,13 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
     identidad.push(`<b>CWE:</b> ${enlazadas}${resto > 0 ? ` +${resto}` : ""}`);
   }
 
-  // Los dos subíndices, cada uno en su línea y contra su tope. Separan dos cosas
-  // que el score junta: lo fácil que es llegar y lo que se lleva por delante, y
-  // en dos líneas se leen en diagonal igual que el resto de los datos.
-  const topes = TG_CVSS_TOPES[nvd?.cvss ?? ""];
-  if (topes) {
-    if (nvd.explotabilidad != null) {
-      medidas.push(`<b>Exploitability:</b> ${nvd.explotabilidad.toFixed(1)} / ${topes.explotabilidad.toFixed(1)}`);
-    }
-    if (nvd.impacto != null) {
-      medidas.push(`<b>Impact:</b> ${nvd.impacto.toFixed(1)} / ${topes.impacto.toFixed(1)}`);
-    }
-  }
-
-  // Con hora y diciendo que es UTC: el NVD la publica sin marca horaria, y una
-  // fecha a secas hace pensar que la vulnerabilidad lleva un día entero fuera
-  // cuando puede llevar veinte minutos.
-  if (nvd?.publicado) {
-    const dia = nvd.publicado.slice(0, 10);
-    const hora = nvd.publicado.slice(11, 16);
-    fechas.push(`<b>Published:</b> ${dia}${/^\d{2}:\d{2}$/.test(hora) ? ` ${hora} UTC` : ""}`);
-  }
   // El plazo de CISA, que el catálogo de VulnCheck arrastra. Va con su nombre
   // porque no es una recomendación de nadie más: es la fecha límite que la BOD de
   // CISA pone a los organismos federales, y en una lista de cosas que ya se están
   // explotando es el único dato con una fecha de verdad.
   if (vc?.plazo) fechas.push(`<b>CISA action due:</b> ${vc.plazo}`);
 
-  const bloques = [identidad, medidas, fechas].filter((b) => b.length).map((b) => b.join("\n"));
+  const bloques = [identidad, fechas].filter((b) => b.length).map((b) => b.join("\n"));
   if (bloques.length) lineas.push("", bloques.join("\n\n"));
 
   // Lo que el catálogo dice que hay que hacer. Va después de los datos y antes de
@@ -1702,9 +1587,7 @@ async function notificarTelegram(filas, registroSembrado = null, vulncheck = nul
       // El encabezado de mudanza solo tiene sentido si de la anterior se llegó a
       // avisar; si no, para quien lo lee es un mensaje nuevo y punto.
       await ritmo();
-      // La puntuación se pide aquí y no antes: solo hace falta para lo que de
-      // verdad se manda, que con el filtro puesto son unos pocos por pasada.
-      const texto = mensajeTelegram(fila, vc, await datosVulncheckNvd(fila.cve), previa?.enviada ? previa : null);
+      const texto = mensajeTelegram(fila, vc, previa?.enviada ? previa : null);
       const { enviado, esperar, chat, mensaje } = await telegramEnviar(destino, texto);
 
       if (!enviado) {
@@ -1744,11 +1627,10 @@ async function notificarTelegram(filas, registroSembrado = null, vulncheck = nul
       if (editadas >= TG_MAX_EDICIONES) break; // el resto, en la siguiente pasada
 
       await ritmo();
-      const nvd = await datosVulncheckNvd(fila.cve);
       const { hecha, esperar, perdido } = await telegramEditar(
         previa.chat,
         previa.mensaje,
-        mensajeTelegram(fila, vc, nvd, null, ahora)
+        mensajeTelegram(fila, vc, null, ahora)
       );
 
       if (!hecha) {

@@ -35,11 +35,6 @@ const API_ENISAID = 'https://euvdservices.enisa.europa.eu/api/enisaid';  // fich
 // igual: la web sale como siempre, con la marca de CISA y EU KEV, y Telegram
 // no manda nada, que es lo correcto: sin catálogo no se sabe qué avisar.
 const API_VULNCHECK_KEV = 'https://api.vulncheck.com/v3/index/vulncheck-kev';
-// El NVD servido por VulnCheck. El catálogo de KEV trae el nombre, el fabricante,
-// el producto y las CWE, pero no la puntuación ni la fecha de publicación, y el
-// mensaje de Telegram las lleva. Se pide por CVE y solo de lo que se va a mandar
-// (unos pocos por pasada), así que no hace falta ni paginar ni cachear en disco.
-const API_VULNCHECK_NVD = 'https://api.vulncheck.com/v3/index/nist-nvd2';
 const VULNCHECK_PAGE = 1000;  // el máximo que sirve de una vez
 // El tier community corta la paginación en 6 páginas: 6.000 entradas, de sobra
 // para las 5.200 de hoy pero no para siempre. pedir_vulncheck_kev() avisa en el
@@ -857,92 +852,6 @@ function ficha_vulncheck(array $e): array
 }
 
 /**
- * La puntuación, el vector, las CWE y la fecha de publicación de un CVE, del NVD
- * que sirve el propio VulnCheck. Es lo único del mensaje que el catálogo de KEV
- * no trae, y se pide de una en una porque solo hace falta para lo que se manda:
- * con el filtro puesto son unos pocos por pasada, muy lejos de las 1.000
- * peticiones por minuto que deja el tier community.
- *
- * @return array<string,mixed>|null
- */
-function pedir_vulncheck_nvd(string $cve): ?array
-{
-    $token = getenv('VULNCHECK_API_TOKEN') ?: '';
-    if ($token === '') return null;
-
-    $respuesta = pedir(API_VULNCHECK_NVD . '?' . http_build_query(['cve' => $cve]),
-        ['Authorization: Bearer ' . $token]);
-    $ficha = is_array($respuesta['data'][0] ?? null) ? $respuesta['data'][0] : null;
-    if ($ficha === null) return null;
-
-    // De las métricas manda la versión más alta que traiga, y a igualdad la del
-    // asignador: es el mismo criterio con el que el NVD enseña una sola.
-    $mejor = null;
-    foreach ((is_array($ficha['metrics'] ?? null) ? $ficha['metrics'] : []) as $clave => $lista) {
-        if (!str_starts_with((string) $clave, 'cvssMetric') || !is_array($lista)) continue;
-
-        foreach ($lista as $m) {
-            $d = $m['cvssData'] ?? null;
-            if (!is_array($d) || !is_numeric($d['baseScore'] ?? null)) continue;
-
-            $version  = (float) ($d['version'] ?? 0);
-            $primaria = ($m['type'] ?? null) === 'Primary';
-            if ($mejor !== null
-                && !($version > $mejor['version'] || ($version === $mejor['version'] && $primaria && !$mejor['primaria']))) {
-                continue;
-            }
-            // Los dos subíndices cuelgan de la métrica, no de cvssData, y se cogen
-            // de la misma que da el score: mezclarlos con los de otra sería sumar
-            // peras y manzanas. El CVSS 4.0 no los tiene, así que ahí van a null.
-            $mejor = [
-                'version'        => $version,
-                'primaria'       => $primaria,
-                'score'          => (float) $d['baseScore'],
-                'vector'         => is_string($d['vectorString'] ?? null) ? $d['vectorString'] : null,
-                'explotabilidad' => is_numeric($m['exploitabilityScore'] ?? null) ? (float) $m['exploitabilityScore'] : null,
-                'impacto'        => is_numeric($m['impactScore'] ?? null) ? (float) $m['impactScore'] : null,
-            ];
-        }
-    }
-
-    $cwes = [];
-    foreach ((is_array($ficha['weaknesses'] ?? null) ? $ficha['weaknesses'] : []) as $w) {
-        foreach ((is_array($w['description'] ?? null) ? $w['description'] : []) as $d) {
-            $v = $d['value'] ?? null;
-            if (is_string($v) && preg_match('/^CWE-\d+$/', $v) === 1) $cwes[] = $v;
-        }
-    }
-
-    return [
-        'score'          => $mejor['score'] ?? null,
-        'cvss'           => $mejor !== null ? (string) $mejor['version'] : null,
-        'vector'         => $mejor['vector'] ?? null,
-        'explotabilidad' => $mejor['explotabilidad'] ?? null,
-        'impacto'        => $mejor['impacto'] ?? null,
-        // Sin recortar: el mensaje enseña también la hora. El NVD la publica en
-        // UTC y sin marca horaria, que es justo por lo que el mensaje lo dice.
-        'publicado'      => is_string($ficha['published'] ?? null) ? $ficha['published'] : null,
-        'cwes'           => array_values(array_unique($cwes)),
-    ];
-}
-
-/**
- * Una sola petición por CVE y pasada: entre un envío y la edición del mismo
- * mensaje no hace falta volver a preguntar.
- *
- * @return array<string,mixed>|null
- */
-function datos_vulncheck_nvd(?string $cve): ?array
-{
-    static $vistas = [];
-
-    if (!is_string($cve) || $cve === '') return null;
-    if (!array_key_exists($cve, $vistas)) $vistas[$cve] = pedir_vulncheck_nvd($cve);
-
-    return $vistas[$cve];
-}
-
-/**
  * Mete en el listado lo explotado que la ventana no alcanza.
  *
  * La búsqueda de la EUVD filtra por fecha de publicación, así que una CVE
@@ -1424,16 +1333,6 @@ const TG_DESC_MAX      = 3000;
 
 const TG_CWE_VISIBLES  = 3;  // el mismo tope que la tabla; el resto va como "+n"
 
-// A cuánto llega cada subíndice, que es lo que los hace legibles: un 1.8 de
-// explotabilidad no dice nada, un "1.8 / 3.9" dice que cuesta explotarla. Los
-// topes no son los mismos en cada versión del CVSS (la 2.0 puntúa los dos sobre
-// 10) y la 4.0 no publica subíndices, así que ahí no sale la línea.
-const TG_CVSS_TOPES = [
-    '2.0' => ['explotabilidad' => 10.0, 'impacto' => 10.0],
-    '3.0' => ['explotabilidad' => 3.9,  'impacto' => 6.0],
-    '3.1' => ['explotabilidad' => 3.9,  'impacto' => 6.0],
-];
-
 // La acción recomendada es plantilla (19 textos distintos para 1.000 entradas)
 // pero las hay de 520 caracteres. El tope está para que una futura más larga no
 // se coma el margen hasta los 4.096 de un mensaje.
@@ -1464,16 +1363,8 @@ const TG_EVIDENCIAS_VISIBLES = 2;
  * @param array<string,mixed>      $fila
  * @param array<string,mixed>|null $previa
  */
-function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?array $previa = null, ?string $actualizado = null): string
+function mensaje_telegram(array $fila, ?array $vc = null, ?array $previa = null, ?string $actualizado = null): string
 {
-    $marcas = [
-        'critica'     => "\u{1F534} CRITICAL",
-        'alta'        => "\u{1F7E0} HIGH",
-        'media'       => "\u{1F7E1} MEDIUM",
-        'baja'        => "\u{1F535} LOW",
-        'sin_puntuar' => "\u{26AA} UNSCORED",
-    ];
-
     $lineas = [];
 
     if ($previa !== null) {
@@ -1490,16 +1381,12 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
         $lineas[] = '';
     }
 
-    // El score del NVD que sirve VulnCheck; la severidad, del mismo corte que usa
-    // la tabla, para que la marca de la cabecera diga lo mismo que el número.
-    $score = is_numeric($nvd['score'] ?? null) ? (float) $nvd['score'] : null;
-    $marca = $marcas[severidad($score)] ?? $marcas['sin_puntuar'];
-    // Sin puntuación la cabecera se queda con la marca a secas: un CVSS 0.0 que
-    // nadie ha puesto sería peor que no decir nada.
-    $puntuacion = ($score !== null && $score > 0.0)
-        ? ' · CVSS <b>' . number_format($score, 1, '.', '') . '</b>'
-        : '';
-    $lineas[] = $marca . $puntuacion . ' · <code>' . escapar_html($fila['cve'] ?? $fila['euvd']) . '</code>';
+    // Sin CVSS, la cabecera es el identificador y el punto rojo. No hay marca de
+    // severidad porque no hay de dónde sacarla, y poner "UNSCORED" en todos los
+    // mensajes sería peor que no poner nada: diría que no está puntuada, cuando lo
+    // que pasa es que aquí no se mira. El rojo es constante a propósito: todo lo
+    // que llega a esta sala se está explotando.
+    $lineas[] = "\u{1F534} " . '<code>' . escapar_html($fila['cve'] ?? $fila['euvd']) . '</code>';
 
     // La descripción trae saltos de línea a media frase, así que se normaliza.
     $descripcion = trim(preg_replace('/\s+/', ' ', (string) ($vc['descripcion'] ?? '')));
@@ -1543,7 +1430,6 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
     // ojo no encuentra dónde mirar; en tres tandas de dos o tres, sí. Cada dato se
     // calla si no lo hay, y un bloque entero desaparece si se quedan todos callados.
     $identidad = [];
-    $medidas   = [];
     $fechas    = [];
 
     if (($vc['vendor'] ?? '') !== '') {
@@ -1557,11 +1443,10 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
     // visibles y un "+n" con el resto: en un mensaje de móvil, seis identificadores
     // seguidos ocupan más que todo lo demás junto.
     //
-    // Mandan las del catálogo de KEV, que van a la causa de lo que se está
-    // explotando; las del NVD entran solo si el catálogo no trae ninguna.
-    $delKev = is_array($vc['cwes'] ?? null) ? $vc['cwes'] : [];
-    $cwes   = array_values(array_filter(
-        count($delKev) > 0 ? $delKev : (is_array($nvd['cwes'] ?? null) ? $nvd['cwes'] : []),
+    // Solo las del catálogo, que las trae una de cada tres entradas. Las otras dos
+    // se quedan sin la línea: la alternativa era pedírselas al NVD.
+    $cwes = array_values(array_filter(
+        is_array($vc['cwes'] ?? null) ? $vc['cwes'] : [],
         static fn ($id): bool => is_string($id) && preg_match('/^CWE-\d+$/', $id) === 1
     ));
 
@@ -1576,30 +1461,6 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
         $identidad[] = '<b>CWE:</b> ' . implode(' · ', $enlazadas) . ($resto > 0 ? ' +' . $resto : '');
     }
 
-    // Los dos subíndices, cada uno en su línea y contra su tope. Separan dos cosas
-    // que el score junta: lo fácil que es llegar y lo que se lleva por delante, y
-    // en dos líneas se leen en diagonal igual que el resto de los datos.
-    $topes = TG_CVSS_TOPES[(string) ($nvd['cvss'] ?? '')] ?? null;
-    if ($topes !== null) {
-        if (($nvd['explotabilidad'] ?? null) !== null) {
-            $medidas[] = '<b>Exploitability:</b> ' . number_format((float) $nvd['explotabilidad'], 1, '.', '')
-                . ' / ' . number_format($topes['explotabilidad'], 1, '.', '');
-        }
-        if (($nvd['impacto'] ?? null) !== null) {
-            $medidas[] = '<b>Impact:</b> ' . number_format((float) $nvd['impacto'], 1, '.', '')
-                . ' / ' . number_format($topes['impacto'], 1, '.', '');
-        }
-    }
-
-    // Con hora y diciendo que es UTC: el NVD la publica sin marca horaria, y una
-    // fecha a secas hace pensar que la vulnerabilidad lleva un día entero fuera
-    // cuando puede llevar veinte minutos.
-    if (is_string($nvd['publicado'] ?? null)) {
-        $dia  = substr($nvd['publicado'], 0, 10);
-        $hora = substr($nvd['publicado'], 11, 5);
-        $fechas[] = '<b>Published:</b> ' . $dia
-            . (preg_match('/^\d{2}:\d{2}$/', $hora) === 1 ? ' ' . $hora . ' UTC' : '');
-    }
     // El plazo de CISA, que el catálogo de VulnCheck arrastra. Va con su nombre
     // porque no es una recomendación de nadie más: es la fecha límite que la BOD de
     // CISA pone a los organismos federales, y en una lista de cosas que ya se están
@@ -1609,7 +1470,7 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
     }
 
     $bloques = [];
-    foreach ([$identidad, $medidas, $fechas] as $bloque) {
+    foreach ([$identidad, $fechas] as $bloque) {
         if (count($bloque) > 0) $bloques[] = implode("\n", $bloque);
     }
     if (count($bloques) > 0) {
@@ -2138,12 +1999,9 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
             // El encabezado de mudanza solo tiene sentido si de la anterior se llegó a
             // avisar; si no, para quien lo lee es un mensaje nuevo y punto.
             $ritmo();
-            // La puntuación se pide aquí y no antes: solo hace falta para lo que de
-            // verdad se manda, que con el filtro puesto son unos pocos por pasada.
             $texto = mensaje_telegram(
                 $e['fila'],
                 $e['vc'] ?? null,
-                datos_vulncheck_nvd($e['fila']['cve'] ?? null),
                 ($previa !== null && ($previa['enviada'] ?? false)) ? $previa : null
             );
             $r = telegram_enviar($token, $e['destino'], $texto);
@@ -2205,8 +2063,7 @@ function notificar_telegram(array $filas, string $token, array $salas, string $r
                 $token,
                 (string) $previa['chat'],
                 (int) $previa['mensaje'],
-                mensaje_telegram($ed['fila'], $ed['vc'] ?? null,
-                    datos_vulncheck_nvd($ed['fila']['cve'] ?? null), null, $ahora)
+                mensaje_telegram($ed['fila'], $ed['vc'] ?? null, null, $ahora)
             );
 
             if (!$r['hecha']) {

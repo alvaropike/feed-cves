@@ -7,9 +7,9 @@ respaldo para las CWE—, FIRST para la EPSS y los catálogos VulnCheck KEV, CIS
 EU KEV para marcar lo que ya se está explotando.
 
 Opcionalmente avisa por Telegram, y ahí manda **VulnCheck y solo VulnCheck**: solo se avisa
-de lo que su catálogo da por explotado, y todo lo que dice el mensaje sale de sus dos
-índices. La web enseña los catorce días enteros con todas las fuentes; el grupo, solo lo que
-hay que parchear ya. Ver más abajo.
+de lo que su catálogo de KEV da por explotado, y todo lo que dice el mensaje sale de esa
+misma ficha. La web enseña los catorce días enteros con todas las fuentes; el grupo, solo lo
+que hay que parchear ya. Ver más abajo.
 
 ## Por qué no se llama a la API desde el navegador
 
@@ -255,10 +255,9 @@ demás sigue en la web —la tabla no cambia— pero no genera mensajes. Es el c
 convierte el grupo en otra cosa: de un boletín de 350 novedades al día a la lista de lo que
 hay que parchear ya, que en una ventana real es **un puñado a la semana**.
 
-**Qué dice el mensaje.** El texto no mezcla fuentes: el nombre, la descripción, el
-fabricante, el producto, las CWE, las fechas, el ransomware, el plazo y las pruebas de
-explotación salen de la ficha de VulnCheck KEV, y la puntuación y la fecha de publicación
-del NVD que sirve el propio VulnCheck (`nist-nvd2`). Ver "Qué llega".
+**Qué dice el mensaje.** El texto sale de **una sola fuente y una sola petición**: la ficha
+del catálogo de KEV. Nombre, descripción, fabricante, producto, CWE, fechas, ransomware,
+plazo, acción recomendada y referencias. Nada más. Ver "Qué llega".
 
 Se eligió VulnCheck y no CISA porque es el mismo dato pero antes y más ancho: 5.200 entradas
 frente a las 1.700 de CISA KEV y EU KEV juntas, ninguna de las cuales falta aquí, y con la
@@ -370,7 +369,7 @@ bot serían miles de mensajes de cosas de hace dos semanas.
 Un mensaje por vulnerabilidad, con lo justo para decidir sin abrir el enlace:
 
 ```
-🔴 CRITICAL · CVSS 9.3 · CVE-2026-9586
+🔴 CVE-2026-9586
 Sangoma Switchvox SQL Injection Vulnerability
 
 ⚠️ Actively exploited — VulnCheck KEV · CISA KEV, added 2026-09-01
@@ -385,10 +384,6 @@ Vendor: Sangoma
 Product: Switchvox
 CWE: CWE-89
 
-Exploitability: 3.9 / 3.9
-Impact: 5.9 / 6.0
-
-Published: 2026-08-14 17:15 UTC
 CISA action due: 2026-09-05
 
 🛠️ Required action
@@ -399,25 +394,26 @@ CISA action due: 2026-09-05
 🔗 horizon3.ai · x.com +30
 ```
 
-**Cada línea sale de VulnCheck.** De la ficha del catálogo de KEV: el título, la descripción,
-el fabricante, el producto, las CWE, la fecha en que entró, la de CISA si además la confirmó,
-el plazo de parcheo, la acción recomendada y las pruebas de explotación. De su índice
-`nist-nvd2`: el CVSS, sus dos subíndices y la fecha de publicación. De las métricas manda la
-versión más alta que traiga —4.0 antes que 3.1— y, a igualdad de versión, la del asignador.
+**Cada línea sale de la ficha del catálogo de KEV**, y de nada más: el título, la
+descripción, el fabricante, el producto, las CWE, la fecha en que entró, la de CISA si además
+la confirmó, el plazo, la acción recomendada y las referencias.
 
-**Los subíndices van contra su tope**, cada uno en su línea: un 1.8 de explotabilidad no dice
-nada, un `1.8 / 3.9` dice que cuesta llegar. Separan dos cosas que el score junta —lo fácil
-que es explotarla y lo que se lleva por delante— y no se mezclan entre métricas: los dos
-salen de la misma que da la puntuación. Los topes cambian con la versión (la 2.0 puntúa los
-dos sobre 10) y la 4.0 no los publica, así que ahí no salen.
+**No se consulta el NVD.** Eso deja el mensaje sin CVSS, sin severidad en la cabecera, sin
+subíndices y sin fecha de publicación, y sin CWE en las dos terceras partes del catálogo, que
+no las trae —solo 317 de cada 1.000 entradas—. A cambio el aviso no depende de una fuente que
+va por detrás: de las CVE recién metidas en KEV, **el NVD solo tiene analizadas menos de la
+mitad** (8 de 20 en una muestra real; el resto están en `Received`, `Awaiting Analysis` o
+`Deferred`). La tabla de la web sí sigue enseñando CVSS, EPSS y CWE, con sus fuentes de
+siempre.
+
+**La cabecera es el identificador y un punto rojo**, sin marca de severidad. Sin CVSS no hay
+de dónde sacarla, y poner `UNSCORED` en todos los mensajes sería peor que no poner nada:
+diría que la vulnerabilidad no está puntuada, cuando lo que pasa es que aquí no se mira. El
+rojo es constante a propósito — todo lo que llega a esta sala se está explotando.
 
 **El plazo va con el nombre de quien lo pone**, `CISA action due`, porque no es una
 recomendación de nadie más: es la fecha límite que la BOD de CISA marca a los organismos
 federales, y el catálogo de VulnCheck la arrastra.
-
-**La fecha de publicación lleva hora y dice que es UTC.** El NVD la sirve sin marca horaria,
-y una fecha a secas hace pensar que la vulnerabilidad lleva un día entero fuera cuando puede
-llevar veinte minutos.
 
 **La acción recomendada** va entre los datos y los enlaces, que es donde le toca: lo de
 arriba explica por qué corre prisa y esto dice qué se hace con ello. Es el campo
@@ -455,14 +451,12 @@ y los enlaces. La cabecera va primera porque es lo único que se lee en la notif
 móvil, y el identificador va en monoespaciada para poder copiarlo de un toque, que es lo
 primero que se hace con un CVE.
 
-**Los datos van a su vez en tres tandas separadas por una línea en blanco** —qué es, cuánto
-pesa y qué fechas tiene—: siete etiquetas seguidas son un formulario y el ojo no encuentra
-dónde mirar. Una tanda entera desaparece si se quedan callados todos sus datos.
+**Los datos van a su vez en tandas separadas por una línea en blanco** —qué es y qué fechas
+tiene—: las etiquetas seguidas de corrido son un formulario y el ojo no encuentra dónde
+mirar. Una tanda entera desaparece si se quedan callados todos sus datos.
 
 Cada dato se calla si no lo hay, que es mejor que una fila con un guion: el producto solo si
-difiere del fabricante; el plazo y la acción, solo si el catálogo los trae; los subíndices,
-solo si la versión del CVSS los publica; el CVSS solo si el NVD de VulnCheck lo tiene, que si
-no la cabecera se queda en `Unscored`.
+difiere del fabricante; y el plazo, las CWE y la acción, solo si el catálogo los trae.
 
 **La línea de abajo son las referencias de VulnCheck y nada más**: las de
 `vulncheck_reported_exploitation`, con las que sostiene que se está explotando. Unas son el
@@ -682,9 +676,7 @@ En `euvd_sync.mjs` y `euvd_sync.php` (los nombres son equivalentes en ambos):
   únicos enlaces que lleva. 2 llegan para verificarlo; el catálogo trae 32 de media por CVE,
   y las que no caben se cuentan en el `+n`.
 - `TG_ACCION_MAX` — tope de la acción recomendada. La más larga que sirve hoy el catálogo
-  mide 520 caracteres.
-- `TG_CVSS_TOPES` — a cuánto llega cada subíndice en cada versión del CVSS. Solo se toca si
-  el NVD empieza a publicar subíndices de la 4.0.
+  mide 488 caracteres, así que no recorta ninguna.
 - `TELEGRAM_PAUSA` — variable de entorno, no constante; ver "El freno de mano".
 - `PAUSA_US` / `PAUSA_MS` — pausa entre peticiones. No lo bajes de 0,3 s.
 - `CONCURRENCIA_TITULOS` — peticiones simultáneas a cve.org. 6 va sobrado; subirlo
