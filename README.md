@@ -384,15 +384,16 @@ Sangoma Switchvox SQL Injection Vulnerability
 Vendor: Sangoma
 Product: Switchvox
 CWE: CWE-89
-Exploitability: 3.9 / 3.9 · Impact: 5.9 / 6.0
+Exploitability: 3.9 / 3.9
+Impact: 5.9 / 6.0
 Published: 2026-08-14 17:15 UTC
-Patch by: 2026-09-05
+CISA action due: 2026-09-05
 
-🛠️ Required action: Apply remediations or mitigations per vendor
-instructions or discontinue use of the product if remediation or
-mitigations are unavailable.
+▎🛠️ Required action: Apply remediations or mitigations per vendor
+▎instructions or discontinue use of the product if remediation or
+▎mitigations are unavailable.
 
-Evidence · Evidence 2 +30
+horizon3.ai · x.com +30
 ```
 
 **Cada línea sale de VulnCheck.** De la ficha del catálogo de KEV: el título, la descripción,
@@ -401,11 +402,15 @@ el plazo de parcheo, la acción recomendada y las pruebas de explotación. De su
 `nist-nvd2`: el CVSS, sus dos subíndices y la fecha de publicación. De las métricas manda la
 versión más alta que traiga —4.0 antes que 3.1— y, a igualdad de versión, la del asignador.
 
-**Los subíndices van contra su tope**, que es lo que los hace legibles: un 1.8 de
-explotabilidad no dice nada, un `1.8 / 3.9` dice que cuesta llegar. Separan dos cosas que el
-score junta —lo fácil que es explotarla y lo que se lleva por delante— y no se mezclan entre
-métricas: los dos salen de la misma que da la puntuación. Los topes cambian con la versión
-(la 2.0 puntúa los dos sobre 10) y la 4.0 no los publica, así que ahí la línea no sale.
+**Los subíndices van contra su tope**, cada uno en su línea: un 1.8 de explotabilidad no dice
+nada, un `1.8 / 3.9` dice que cuesta llegar. Separan dos cosas que el score junta —lo fácil
+que es explotarla y lo que se lleva por delante— y no se mezclan entre métricas: los dos
+salen de la misma que da la puntuación. Los topes cambian con la versión (la 2.0 puntúa los
+dos sobre 10) y la 4.0 no los publica, así que ahí no salen.
+
+**El plazo va con el nombre de quien lo pone**, `CISA action due`, porque no es una
+recomendación de nadie más: es la fecha límite que la BOD de CISA marca a los organismos
+federales, y el catálogo de VulnCheck la arrastra.
 
 **La fecha de publicación lleva hora y dice que es UTC.** El NVD la sirve sin marca horaria,
 y una fecha a secas hace pensar que la vulnerabilidad lleva un día entero fuera cuando puede
@@ -415,6 +420,11 @@ llevar veinte minutos.
 arriba explica por qué corre prisa y esto dice qué se hace con ello. Es el campo
 `required_action` **tal cual lo sirve el catálogo**: no se resume ni se reescribe, solo se
 colapsan los espacios. El ejemplo de arriba es uno de sus textos literales.
+
+Va **en una cita, igual que la descripción y por el mismo motivo**: casi siempre es plantilla
+de CISA, así que ocuparía media pantalla diciendo lo de siempre. Por encima de
+`TG_DESC_PLEGABLE` (300) Telegram la pliega; la etiqueta va dentro de la cita para que se
+siga viendo con el resto plegado.
 
 Es plantilla —19 valores distintos para 1.000 entradas, y uno solo cubre dos tercios— pero
 los hay de 488 caracteres, así que `TG_ACCION_MAX` (600) está para que uno futuro más largo
@@ -456,6 +466,12 @@ Ni la ficha de la EUVD —iba primera por ser de donde salía el CVSS, y el CVSS
 ahí— ni el registro del CVE: el identificador está arriba en monoespaciada, que es lo que se
 copia. El catálogo trae **32 referencias de media** por CVE, así que se enseñan
 `TG_EVIDENCIAS_VISIBLES` (2) y el resto se resume en un `+n`, igual que las CWE.
+
+**Cada enlace se etiqueta con su dominio**, no con un "Evidence" que no dice nada: lo que
+decide si merece el toque es si viene de `msrc.microsoft.com` o de un hilo de `x.com`. Por
+eso también se escogen de dominios distintos —dos `x.com` seguidos no aportan— y se le quita
+el `www.`; el `+n` sigue contando todas las que no caben. Una URL que no parsee se descarta:
+sin dominio no habría etiqueta que poner.
 
 Las **CWE van enlazadas a cwe.mitre.org**, con el mismo tope de tres visibles y el mismo
 `+n` que la tabla: en la pantalla de un móvil, seis identificadores seguidos ocupan más que

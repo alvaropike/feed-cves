@@ -1389,6 +1389,20 @@ function escapar_html(?string $texto): string
 }
 
 /**
+ * El dominio de una URL, sin el "www.", que es como se identifica una fuente de
+ * un vistazo. Una URL rota devuelve null y su enlace no se enseña: sin dominio no
+ * habría nada que poner de etiqueta.
+ */
+function dominio_de(string $url): ?string
+{
+    $host = parse_url($url, PHP_URL_HOST);
+    if (!is_string($host) || $host === '') return null;
+
+    $host = preg_replace('/^www\./', '', $host);
+    return $host !== '' ? $host : null;
+}
+
+/**
  * Los mensajes van en inglés porque es el idioma de las fuentes: el título viene
  * de cve.org, las CWE de MITRE y los catálogos KEV de CISA y ENISA. Traducir la
  * mitad de cada mensaje dejaba frases a medio idioma.
@@ -1557,20 +1571,19 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
         $datos[] = '<b>CWE:</b> ' . implode(', ', $enlazadas) . ($resto > 0 ? ' +' . $resto : '');
     }
 
-    // Los dos subíndices en una línea, cada uno contra su tope. Separan dos cosas
-    // que el score junta: lo fácil que es llegar y lo que se lleva por delante.
+    // Los dos subíndices, cada uno en su línea y contra su tope. Separan dos cosas
+    // que el score junta: lo fácil que es llegar y lo que se lleva por delante, y
+    // en dos líneas se leen en diagonal igual que el resto de los datos.
     $topes = TG_CVSS_TOPES[(string) ($nvd['cvss'] ?? '')] ?? null;
-    if ($topes !== null && (($nvd['explotabilidad'] ?? null) !== null || ($nvd['impacto'] ?? null) !== null)) {
-        $partes = [];
+    if ($topes !== null) {
         if (($nvd['explotabilidad'] ?? null) !== null) {
-            $partes[] = '<b>Exploitability:</b> ' . number_format((float) $nvd['explotabilidad'], 1, '.', '')
+            $datos[] = '<b>Exploitability:</b> ' . number_format((float) $nvd['explotabilidad'], 1, '.', '')
                 . ' / ' . number_format($topes['explotabilidad'], 1, '.', '');
         }
         if (($nvd['impacto'] ?? null) !== null) {
-            $partes[] = '<b>Impact:</b> ' . number_format((float) $nvd['impacto'], 1, '.', '')
+            $datos[] = '<b>Impact:</b> ' . number_format((float) $nvd['impacto'], 1, '.', '')
                 . ' / ' . number_format($topes['impacto'], 1, '.', '');
         }
-        $datos[] = implode(' · ', $partes);
     }
 
     // Con hora y diciendo que es UTC: el NVD la publica sin marca horaria, y una
@@ -1582,10 +1595,12 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
         $datos[] = '<b>Published:</b> ' . $dia
             . (preg_match('/^\d{2}:\d{2}$/', $hora) === 1 ? ' ' . $hora . ' UTC' : '');
     }
-    // El plazo de CISA, que el catálogo de VulnCheck arrastra. En una lista de cosas
-    // que ya se están explotando es el único dato con una fecha límite de verdad.
+    // El plazo de CISA, que el catálogo de VulnCheck arrastra. Va con su nombre
+    // porque no es una recomendación de nadie más: es la fecha límite que la BOD de
+    // CISA pone a los organismos federales, y en una lista de cosas que ya se están
+    // explotando es el único dato con una fecha de verdad.
     if (is_string($vc['plazo'] ?? null)) {
-        $datos[] = '<b>Patch by:</b> ' . $vc['plazo'];
+        $datos[] = '<b>CISA action due:</b> ' . $vc['plazo'];
     }
 
     if (count($datos) > 0) {
@@ -1601,8 +1616,13 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
         if (mb_strlen($accion) > TG_ACCION_MAX) {
             $accion = preg_replace('/\s+\S*$/u', '', mb_substr($accion, 0, TG_ACCION_MAX)) . '…';
         }
+        // En una cita como la descripción, y por el mismo motivo: casi siempre es
+        // plantilla de CISA, así que ocupa media pantalla diciendo lo de siempre. La
+        // etiqueta va dentro de la cita para que se siga viendo con el resto plegado.
+        $cita = mb_strlen($accion) > TG_DESC_PLEGABLE ? 'blockquote expandable' : 'blockquote';
         $lineas[] = '';
-        $lineas[] = "\u{1F6E0}\u{FE0F} <b>Required action:</b> " . escapar_html($accion);
+        $lineas[] = '<' . $cita . '>' . "\u{1F6E0}\u{FE0F} <b>Required action:</b> "
+            . escapar_html($accion) . '</blockquote>';
     }
 
     // La línea de abajo son las referencias de VulnCheck y nada más. Ni la ficha de
@@ -1612,14 +1632,31 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
     // el aviso. El "+n" dice cuántas más hay, igual que en las CWE.
     $evidencias = is_array($vc['evidencias'] ?? null) ? $vc['evidencias'] : [];
     if (count($evidencias) > 0) {
-        $enlaces = [];
-        foreach (array_slice($evidencias, 0, TG_EVIDENCIAS_VISIBLES) as $i => $url) {
-            $enlaces[] = '<a href="' . escapar_html($url) . '">Evidence'
-                . ($i > 0 ? ' ' . ($i + 1) : '') . '</a>';
+        // Cada una se etiqueta con su dominio, que es lo que decide si merece el
+        // toque: no es lo mismo el aviso de msrc.microsoft.com que un hilo de x.com.
+        // Y por eso se escogen de dominios distintos (dos "x.com" seguidos no dicen
+        // nada), aunque el "+n" siga contando todas las que no caben.
+        $vistos   = [];
+        $elegidas = [];
+        foreach ($evidencias as $url) {
+            $dominio = dominio_de($url);
+            if ($dominio === null || isset($vistos[$dominio])) continue;
+
+            $vistos[$dominio] = true;
+            $elegidas[] = ['url' => $url, 'dominio' => $dominio];
+            if (count($elegidas) === TG_EVIDENCIAS_VISIBLES) break;
         }
-        $resto = count($evidencias) - TG_EVIDENCIAS_VISIBLES;
-        $lineas[] = '';
-        $lineas[] = implode(' · ', $enlaces) . ($resto > 0 ? ' +' . $resto : '');
+
+        if (count($elegidas) > 0) {
+            $enlaces = [];
+            foreach ($elegidas as $e) {
+                $enlaces[] = '<a href="' . escapar_html($e['url']) . '">'
+                    . escapar_html($e['dominio']) . '</a>';
+            }
+            $resto = count($evidencias) - count($elegidas);
+            $lineas[] = '';
+            $lineas[] = implode(' · ', $enlaces) . ($resto > 0 ? ' +' . $resto : '');
+        }
     }
 
     if ($actualizado !== null) {

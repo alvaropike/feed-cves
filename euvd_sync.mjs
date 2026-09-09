@@ -1090,6 +1090,19 @@ const escaparHtml = (texto) =>
     .replace(/>/g, "&gt;");
 
 /**
+ * El dominio de una URL, sin el "www.", que es como se identifica una fuente de
+ * un vistazo. Una URL rota devuelve null y su enlace no se enseña: sin dominio no
+ * habría nada que poner de etiqueta.
+ */
+function dominioDe(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "") || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Los mensajes van en inglés porque es el idioma de las fuentes: el título viene
  * de cve.org, las CWE de MITRE y los catálogos KEV de CISA y ENISA. Traducir la
  * mitad de cada mensaje dejaba frases a medio idioma.
@@ -1245,18 +1258,17 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
     datos.push(`<b>CWE:</b> ${enlazadas}${resto > 0 ? ` +${resto}` : ""}`);
   }
 
-  // Los dos subíndices en una línea, cada uno contra su tope. Separan dos cosas
-  // que el score junta: lo fácil que es llegar y lo que se lleva por delante.
+  // Los dos subíndices, cada uno en su línea y contra su tope. Separan dos cosas
+  // que el score junta: lo fácil que es llegar y lo que se lleva por delante, y
+  // en dos líneas se leen en diagonal igual que el resto de los datos.
   const topes = TG_CVSS_TOPES[nvd?.cvss ?? ""];
-  if (topes && (nvd.explotabilidad != null || nvd.impacto != null)) {
-    const partes = [];
+  if (topes) {
     if (nvd.explotabilidad != null) {
-      partes.push(`<b>Exploitability:</b> ${nvd.explotabilidad.toFixed(1)} / ${topes.explotabilidad.toFixed(1)}`);
+      datos.push(`<b>Exploitability:</b> ${nvd.explotabilidad.toFixed(1)} / ${topes.explotabilidad.toFixed(1)}`);
     }
     if (nvd.impacto != null) {
-      partes.push(`<b>Impact:</b> ${nvd.impacto.toFixed(1)} / ${topes.impacto.toFixed(1)}`);
+      datos.push(`<b>Impact:</b> ${nvd.impacto.toFixed(1)} / ${topes.impacto.toFixed(1)}`);
     }
-    datos.push(partes.join(" · "));
   }
 
   // Con hora y diciendo que es UTC: el NVD la publica sin marca horaria, y una
@@ -1267,9 +1279,11 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
     const hora = nvd.publicado.slice(11, 16);
     datos.push(`<b>Published:</b> ${dia}${/^\d{2}:\d{2}$/.test(hora) ? ` ${hora} UTC` : ""}`);
   }
-  // El plazo de CISA, que el catálogo de VulnCheck arrastra. En una lista de cosas
-  // que ya se están explotando es el único dato con una fecha límite de verdad.
-  if (vc?.plazo) datos.push(`<b>Patch by:</b> ${vc.plazo}`);
+  // El plazo de CISA, que el catálogo de VulnCheck arrastra. Va con su nombre
+  // porque no es una recomendación de nadie más: es la fecha límite que la BOD de
+  // CISA pone a los organismos federales, y en una lista de cosas que ya se están
+  // explotando es el único dato con una fecha de verdad.
+  if (vc?.plazo) datos.push(`<b>CISA action due:</b> ${vc.plazo}`);
 
   if (datos.length) lineas.push("", ...datos);
 
@@ -1282,7 +1296,11 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
       accion.length > TG_ACCION_MAX
         ? accion.slice(0, TG_ACCION_MAX).replace(/\s+\S*$/, "") + "…"
         : accion;
-    lineas.push("", `\u{1F6E0}\u{FE0F} <b>Required action:</b> ${escaparHtml(recortada)}`);
+    // En una cita como la descripción, y por el mismo motivo: casi siempre es
+    // plantilla de CISA, así que ocupa media pantalla diciendo lo de siempre. La
+    // etiqueta va dentro de la cita para que se siga viendo con el resto plegado.
+    const cita = recortada.length > TG_DESC_PLEGABLE ? "blockquote expandable" : "blockquote";
+    lineas.push("", `<${cita}>\u{1F6E0}\u{FE0F} <b>Required action:</b> ${escaparHtml(recortada)}</blockquote>`);
   }
 
   // La línea de abajo son las referencias de VulnCheck y nada más. Ni la ficha de
@@ -1292,11 +1310,27 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
   // el aviso. El "+n" dice cuántas más hay, igual que en las CWE.
   const evidencias = vc?.evidencias ?? [];
   if (evidencias.length) {
-    const enlaces = evidencias
-      .slice(0, TG_EVIDENCIAS_VISIBLES)
-      .map((url, i) => `<a href="${escaparHtml(url)}">Evidence${i > 0 ? ` ${i + 1}` : ""}</a>`);
-    const resto = evidencias.length - TG_EVIDENCIAS_VISIBLES;
-    lineas.push("", enlaces.join(" · ") + (resto > 0 ? ` +${resto}` : ""));
+    // Cada una se etiqueta con su dominio, que es lo que decide si merece el
+    // toque: no es lo mismo el aviso de msrc.microsoft.com que un hilo de x.com.
+    // Y por eso se escogen de dominios distintos —dos "x.com" seguidos no dicen
+    // nada—, aunque el "+n" siga contando todas las que no caben.
+    const vistos = new Set();
+    const elegidas = [];
+    for (const url of evidencias) {
+      const dominio = dominioDe(url);
+      if (!dominio || vistos.has(dominio)) continue;
+      vistos.add(dominio);
+      elegidas.push({ url, dominio });
+      if (elegidas.length === TG_EVIDENCIAS_VISIBLES) break;
+    }
+
+    if (elegidas.length) {
+      const enlaces = elegidas.map(
+        ({ url, dominio }) => `<a href="${escaparHtml(url)}">${escaparHtml(dominio)}</a>`
+      );
+      const resto = evidencias.length - elegidas.length;
+      lineas.push("", enlaces.join(" · ") + (resto > 0 ? ` +${resto}` : ""));
+    }
   }
 
   if (actualizado) lineas.push("", `<i>Updated ${actualizado.slice(0, 16).replace("T", " ")} UTC</i>`);
