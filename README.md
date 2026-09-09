@@ -374,7 +374,7 @@ Un mensaje por vulnerabilidad, con lo justo para decidir sin abrir el enlace:
 Sangoma Switchvox SQL Injection Vulnerability
 
 ⚠️ Actively exploited — VulnCheck KEV · CISA KEV, added 2026-09-01
-🔓 Known ransomware campaign use
+🔒 Known ransomware campaign use
 📡 Exploitation seen by VulnCheck canaries
 
 ▎Sangoma Switchvox contains a SQL injection vulnerability which
@@ -384,16 +384,19 @@ Sangoma Switchvox SQL Injection Vulnerability
 Vendor: Sangoma
 Product: Switchvox
 CWE: CWE-89
+
 Exploitability: 3.9 / 3.9
 Impact: 5.9 / 6.0
+
 Published: 2026-08-14 17:15 UTC
 CISA action due: 2026-09-05
 
-▎🛠️ Required action: Apply remediations or mitigations per vendor
-▎instructions or discontinue use of the product if remediation or
-▎mitigations are unavailable.
+🛠️ Required action
+▎Apply remediations or mitigations per vendor instructions or
+▎discontinue use of the product if remediation or mitigations are
+▎unavailable.
 
-horizon3.ai · x.com +30
+🔗 horizon3.ai · x.com +30
 ```
 
 **Cada línea sale de VulnCheck.** De la ficha del catálogo de KEV: el título, la descripción,
@@ -423,8 +426,8 @@ colapsan los espacios. El ejemplo de arriba es uno de sus textos literales.
 
 Va **en una cita, igual que la descripción y por el mismo motivo**: casi siempre es plantilla
 de CISA, así que ocuparía media pantalla diciendo lo de siempre. Por encima de
-`TG_DESC_PLEGABLE` (300) Telegram la pliega; la etiqueta va dentro de la cita para que se
-siga viendo con el resto plegado.
+`TG_DESC_PLEGABLE` (300) Telegram la pliega. El rótulo va **fuera y encima** de la cita: si
+va dentro se pliega con el texto y lo que queda es un recuadro gris sin decir de qué es.
 
 Es plantilla —19 valores distintos para 1.000 entradas, y uno solo cubre dos tercios— pero
 los hay de 488 caracteres, así que `TG_ACCION_MAX` (600) está para que uno futuro más largo
@@ -447,10 +450,14 @@ community, así que no hace falta ni paginar ni cachear en disco.
 CWE de MITRE, los catálogos de CISA y ENISA—, así que traducir el envoltorio dejaba cada
 mensaje a medio idioma. Los logs y el código siguen en castellano.
 
-Cuatro bloques: cabecera, título, la alerta de explotación si la hay, los datos y los
-enlaces. La cabecera va primera porque es lo único que se lee en la notificación del móvil,
-y el identificador va en monoespaciada para poder copiarlo de un toque, que es lo primero
-que se hace con un CVE.
+Cinco bloques: cabecera, título, la alerta de explotación, los datos, la acción recomendada
+y los enlaces. La cabecera va primera porque es lo único que se lee en la notificación del
+móvil, y el identificador va en monoespaciada para poder copiarlo de un toque, que es lo
+primero que se hace con un CVE.
+
+**Los datos van a su vez en tres tandas separadas por una línea en blanco** —qué es, cuánto
+pesa y qué fechas tiene—: siete etiquetas seguidas son un formulario y el ojo no encuentra
+dónde mirar. Una tanda entera desaparece si se quedan callados todos sus datos.
 
 Cada dato se calla si no lo hay, que es mejor que una fila con un guion: el producto solo si
 difiere del fabricante; el plazo y la acción, solo si el catálogo los trae; los subíndices,

@@ -1221,7 +1221,7 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
   // Las dos cosas que separan lo urgente de lo muy urgente, y que no las da
   // ningún otro catálogo: si hay ransomware usándola y si la han visto entrar
   // en los señuelos de VulnCheck.
-  if (vc?.ransomware) lineas.push("\u{1F513} <b>Known ransomware campaign use</b>");
+  if (vc?.ransomware) lineas.push("\u{1F512} <b>Known ransomware campaign use</b>");
   if (vc?.canarios) lineas.push("\u{1F4E1} Exploitation seen by VulnCheck canaries");
 
   if (descripcion) {
@@ -1233,13 +1233,17 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
     lineas.push("", `<${cita}>${escaparHtml(recortada)}</blockquote>`);
   }
 
-  // Datos etiquetados: se leen en diagonal y cada uno se calla si no hay dato,
-  // que es mejor que una fila con un guion.
-  const datos = [];
+  // Datos etiquetados, en tres bloques separados por una línea en blanco: qué es,
+  // cuánto pesa y qué fechas tiene. Siete etiquetas seguidas son un formulario y el
+  // ojo no encuentra dónde mirar; en tres tandas de dos o tres, sí. Cada dato se
+  // calla si no lo hay, y un bloque entero desaparece si se quedan todos callados.
+  const identidad = [];
+  const medidas = [];
+  const fechas = [];
 
-  if (vc?.vendor) datos.push(`<b>Vendor:</b> ${escaparHtml(vc.vendor)}`);
+  if (vc?.vendor) identidad.push(`<b>Vendor:</b> ${escaparHtml(vc.vendor)}`);
   if (vc?.producto && vc.producto !== vc.vendor) {
-    datos.push(`<b>Product:</b> ${escaparHtml(vc.producto)}`);
+    identidad.push(`<b>Product:</b> ${escaparHtml(vc.producto)}`);
   }
 
   // Enlazadas a cwe.mitre.org, igual que en la tabla, y con el mismo tope de tres
@@ -1253,9 +1257,9 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
     const enlazadas = cwes
       .slice(0, TG_CWE_VISIBLES)
       .map((id) => `<a href="https://cwe.mitre.org/data/definitions/${id.slice(4)}.html">${id}</a>`)
-      .join(", ");
+      .join(" · ");
     const resto = cwes.length - TG_CWE_VISIBLES;
-    datos.push(`<b>CWE:</b> ${enlazadas}${resto > 0 ? ` +${resto}` : ""}`);
+    identidad.push(`<b>CWE:</b> ${enlazadas}${resto > 0 ? ` +${resto}` : ""}`);
   }
 
   // Los dos subíndices, cada uno en su línea y contra su tope. Separan dos cosas
@@ -1264,10 +1268,10 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
   const topes = TG_CVSS_TOPES[nvd?.cvss ?? ""];
   if (topes) {
     if (nvd.explotabilidad != null) {
-      datos.push(`<b>Exploitability:</b> ${nvd.explotabilidad.toFixed(1)} / ${topes.explotabilidad.toFixed(1)}`);
+      medidas.push(`<b>Exploitability:</b> ${nvd.explotabilidad.toFixed(1)} / ${topes.explotabilidad.toFixed(1)}`);
     }
     if (nvd.impacto != null) {
-      datos.push(`<b>Impact:</b> ${nvd.impacto.toFixed(1)} / ${topes.impacto.toFixed(1)}`);
+      medidas.push(`<b>Impact:</b> ${nvd.impacto.toFixed(1)} / ${topes.impacto.toFixed(1)}`);
     }
   }
 
@@ -1277,15 +1281,16 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
   if (nvd?.publicado) {
     const dia = nvd.publicado.slice(0, 10);
     const hora = nvd.publicado.slice(11, 16);
-    datos.push(`<b>Published:</b> ${dia}${/^\d{2}:\d{2}$/.test(hora) ? ` ${hora} UTC` : ""}`);
+    fechas.push(`<b>Published:</b> ${dia}${/^\d{2}:\d{2}$/.test(hora) ? ` ${hora} UTC` : ""}`);
   }
   // El plazo de CISA, que el catálogo de VulnCheck arrastra. Va con su nombre
   // porque no es una recomendación de nadie más: es la fecha límite que la BOD de
   // CISA pone a los organismos federales, y en una lista de cosas que ya se están
   // explotando es el único dato con una fecha de verdad.
-  if (vc?.plazo) datos.push(`<b>CISA action due:</b> ${vc.plazo}`);
+  if (vc?.plazo) fechas.push(`<b>CISA action due:</b> ${vc.plazo}`);
 
-  if (datos.length) lineas.push("", ...datos);
+  const bloques = [identidad, medidas, fechas].filter((b) => b.length).map((b) => b.join("\n"));
+  if (bloques.length) lineas.push("", bloques.join("\n\n"));
 
   // Lo que el catálogo dice que hay que hacer. Va después de los datos y antes de
   // los enlaces porque es la conclusión del mensaje: lo de arriba explica por qué
@@ -1297,10 +1302,15 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
         ? accion.slice(0, TG_ACCION_MAX).replace(/\s+\S*$/, "") + "…"
         : accion;
     // En una cita como la descripción, y por el mismo motivo: casi siempre es
-    // plantilla de CISA, así que ocupa media pantalla diciendo lo de siempre. La
-    // etiqueta va dentro de la cita para que se siga viendo con el resto plegado.
+    // plantilla de CISA, así que ocupa media pantalla diciendo lo de siempre. El
+    // rótulo va fuera y encima: dentro de la cita se pliega con el texto y queda un
+    // recuadro gris sin decir de qué es.
     const cita = recortada.length > TG_DESC_PLEGABLE ? "blockquote expandable" : "blockquote";
-    lineas.push("", `<${cita}>\u{1F6E0}\u{FE0F} <b>Required action:</b> ${escaparHtml(recortada)}</blockquote>`);
+    lineas.push(
+      "",
+      "\u{1F6E0}\u{FE0F} <b>Required action</b>",
+      `<${cita}>${escaparHtml(recortada)}</blockquote>`
+    );
   }
 
   // La línea de abajo son las referencias de VulnCheck y nada más. Ni la ficha de
@@ -1329,7 +1339,9 @@ function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado
         ({ url, dominio }) => `<a href="${escaparHtml(url)}">${escaparHtml(dominio)}</a>`
       );
       const resto = evidencias.length - elegidas.length;
-      lineas.push("", enlaces.join(" · ") + (resto > 0 ? ` +${resto}` : ""));
+      // Con su emoji, como los demás bloques: una línea de enlaces suelta al final
+      // parece que se ha caído del mensaje en vez de cerrarlo.
+      lineas.push("", `\u{1F517} ${enlaces.join(" · ")}${resto > 0 ? ` +${resto}` : ""}`);
     }
   }
 

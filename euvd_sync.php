@@ -1526,7 +1526,7 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
     // Las dos cosas que separan lo urgente de lo muy urgente, y que no las da
     // ningún otro catálogo: si hay ransomware usándola y si la han visto entrar
     // en los señuelos de VulnCheck.
-    if ($vc['ransomware'] ?? false) $lineas[] = "\u{1F513} <b>Known ransomware campaign use</b>";
+    if ($vc['ransomware'] ?? false) $lineas[] = "\u{1F512} <b>Known ransomware campaign use</b>";
     if ($vc['canarios'] ?? false)   $lineas[] = "\u{1F4E1} Exploitation seen by VulnCheck canaries";
 
     if ($descripcion !== '') {
@@ -1538,15 +1538,19 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
         $lineas[] = '<' . $cita . '>' . escapar_html($descripcion) . '</blockquote>';
     }
 
-    // Datos etiquetados: se leen en diagonal y cada uno se calla si no hay dato,
-    // que es mejor que una fila con un guion.
-    $datos = [];
+    // Datos etiquetados, en tres bloques separados por una línea en blanco: qué es,
+    // cuánto pesa y qué fechas tiene. Siete etiquetas seguidas son un formulario y el
+    // ojo no encuentra dónde mirar; en tres tandas de dos o tres, sí. Cada dato se
+    // calla si no lo hay, y un bloque entero desaparece si se quedan todos callados.
+    $identidad = [];
+    $medidas   = [];
+    $fechas    = [];
 
     if (($vc['vendor'] ?? '') !== '') {
-        $datos[] = '<b>Vendor:</b> ' . escapar_html($vc['vendor']);
+        $identidad[] = '<b>Vendor:</b> ' . escapar_html($vc['vendor']);
     }
     if (($vc['producto'] ?? '') !== '' && $vc['producto'] !== ($vc['vendor'] ?? null)) {
-        $datos[] = '<b>Product:</b> ' . escapar_html($vc['producto']);
+        $identidad[] = '<b>Product:</b> ' . escapar_html($vc['producto']);
     }
 
     // Enlazadas a cwe.mitre.org, igual que en la tabla, y con el mismo tope de tres
@@ -1568,7 +1572,8 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
                 . substr($id, 4) . '.html">' . $id . '</a>';
         }
         $resto = count($cwes) - TG_CWE_VISIBLES;
-        $datos[] = '<b>CWE:</b> ' . implode(', ', $enlazadas) . ($resto > 0 ? ' +' . $resto : '');
+        // El separador de las CWE, igual que el del resto del mensaje.
+        $identidad[] = '<b>CWE:</b> ' . implode(' · ', $enlazadas) . ($resto > 0 ? ' +' . $resto : '');
     }
 
     // Los dos subíndices, cada uno en su línea y contra su tope. Separan dos cosas
@@ -1577,11 +1582,11 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
     $topes = TG_CVSS_TOPES[(string) ($nvd['cvss'] ?? '')] ?? null;
     if ($topes !== null) {
         if (($nvd['explotabilidad'] ?? null) !== null) {
-            $datos[] = '<b>Exploitability:</b> ' . number_format((float) $nvd['explotabilidad'], 1, '.', '')
+            $medidas[] = '<b>Exploitability:</b> ' . number_format((float) $nvd['explotabilidad'], 1, '.', '')
                 . ' / ' . number_format($topes['explotabilidad'], 1, '.', '');
         }
         if (($nvd['impacto'] ?? null) !== null) {
-            $datos[] = '<b>Impact:</b> ' . number_format((float) $nvd['impacto'], 1, '.', '')
+            $medidas[] = '<b>Impact:</b> ' . number_format((float) $nvd['impacto'], 1, '.', '')
                 . ' / ' . number_format($topes['impacto'], 1, '.', '');
         }
     }
@@ -1592,7 +1597,7 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
     if (is_string($nvd['publicado'] ?? null)) {
         $dia  = substr($nvd['publicado'], 0, 10);
         $hora = substr($nvd['publicado'], 11, 5);
-        $datos[] = '<b>Published:</b> ' . $dia
+        $fechas[] = '<b>Published:</b> ' . $dia
             . (preg_match('/^\d{2}:\d{2}$/', $hora) === 1 ? ' ' . $hora . ' UTC' : '');
     }
     // El plazo de CISA, que el catálogo de VulnCheck arrastra. Va con su nombre
@@ -1600,12 +1605,16 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
     // CISA pone a los organismos federales, y en una lista de cosas que ya se están
     // explotando es el único dato con una fecha de verdad.
     if (is_string($vc['plazo'] ?? null)) {
-        $datos[] = '<b>CISA action due:</b> ' . $vc['plazo'];
+        $fechas[] = '<b>CISA action due:</b> ' . $vc['plazo'];
     }
 
-    if (count($datos) > 0) {
+    $bloques = [];
+    foreach ([$identidad, $medidas, $fechas] as $bloque) {
+        if (count($bloque) > 0) $bloques[] = implode("\n", $bloque);
+    }
+    if (count($bloques) > 0) {
         $lineas[] = '';
-        $lineas   = array_merge($lineas, $datos);
+        $lineas[] = implode("\n\n", $bloques);
     }
 
     // Lo que el catálogo dice que hay que hacer. Va después de los datos y antes de
@@ -1617,12 +1626,13 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
             $accion = preg_replace('/\s+\S*$/u', '', mb_substr($accion, 0, TG_ACCION_MAX)) . '…';
         }
         // En una cita como la descripción, y por el mismo motivo: casi siempre es
-        // plantilla de CISA, así que ocupa media pantalla diciendo lo de siempre. La
-        // etiqueta va dentro de la cita para que se siga viendo con el resto plegado.
+        // plantilla de CISA, así que ocupa media pantalla diciendo lo de siempre. El
+        // rótulo va fuera y encima: dentro de la cita se pliega con el texto y queda un
+        // recuadro gris sin decir de qué es.
         $cita = mb_strlen($accion) > TG_DESC_PLEGABLE ? 'blockquote expandable' : 'blockquote';
         $lineas[] = '';
-        $lineas[] = '<' . $cita . '>' . "\u{1F6E0}\u{FE0F} <b>Required action:</b> "
-            . escapar_html($accion) . '</blockquote>';
+        $lineas[] = "\u{1F6E0}\u{FE0F} <b>Required action</b>";
+        $lineas[] = '<' . $cita . '>' . escapar_html($accion) . '</blockquote>';
     }
 
     // La línea de abajo son las referencias de VulnCheck y nada más. Ni la ficha de
@@ -1654,8 +1664,10 @@ function mensaje_telegram(array $fila, ?array $vc = null, ?array $nvd = null, ?a
                     . escapar_html($e['dominio']) . '</a>';
             }
             $resto = count($evidencias) - count($elegidas);
+            // Con su emoji, como los demás bloques: una línea de enlaces suelta al
+            // final parece que se ha caído del mensaje en vez de cerrarlo.
             $lineas[] = '';
-            $lineas[] = implode(' · ', $enlaces) . ($resto > 0 ? ' +' . $resto : '');
+            $lineas[] = "\u{1F517} " . implode(' · ', $enlaces) . ($resto > 0 ? ' +' . $resto : '');
         }
     }
 
