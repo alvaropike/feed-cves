@@ -24,6 +24,26 @@ const API_SEARCH = "https://euvdservices.enisa.europa.eu/api/search";
 const API_CVE = "https://cveawg.mitre.org/api/cve/"; // registros oficiales de cve.org
 const API_KEV = "https://euvdservices.enisa.europa.eu/api/kev/dump"; // CISA KEV + EU KEV
 const API_ENISAID = "https://euvdservices.enisa.europa.eu/api/enisaid"; // ficha suelta, por id
+
+// VulnCheck KEV: el mismo catálogo de explotación activa que el de la EUVD, pero
+// más grande —5.200 entradas frente a 1.700, y ninguna de la EUVD falta aquí— y
+// por delante: CISA suele confirmar uno o dos días después. Es la fuente que
+// decide qué llega a Telegram; ver notificarTelegram(). Sin token el sync corre
+// igual: la web sale como siempre, con la marca de CISA y EU KEV, y Telegram
+// no manda nada, que es lo correcto — sin catálogo no se sabe qué avisar.
+const API_VULNCHECK_KEV = "https://api.vulncheck.com/v3/index/vulncheck-kev";
+// El NVD servido por VulnCheck. El catálogo de KEV trae el nombre, el fabricante,
+// el producto y las CWE, pero no la puntuación ni la fecha de publicación, y el
+// mensaje de Telegram las lleva. Se pide por CVE y solo de lo que se va a mandar
+// —unos pocos por pasada—, así que no hace falta ni paginar ni cachear en disco.
+const API_VULNCHECK_NVD = "https://api.vulncheck.com/v3/index/nist-nvd2";
+const VULNCHECK_TOKEN = process.env.VULNCHECK_API_TOKEN ?? "";
+const VULNCHECK_PAGE = 1000; // el máximo que sirve de una vez
+// El tier community corta la paginación en 6 páginas: 6.000 entradas, de sobra
+// para las 5.200 de hoy pero no para siempre. pedirVulncheckKev() avisa en el
+// log en cuanto el catálogo no quepa, porque a partir de ahí el filtro de
+// Telegram se dejaría fuera lo que no haya bajado.
+const VULNCHECK_MAX_PAGINAS = 6;
 const VENTANA_DIAS = 14; // cuántos días hacia atrás pedir
 const PAGE_SIZE = 100; // máximo que admite la API
 // La ventana de 14 días ronda las 6.000 vulnerabilidades, así que 25 páginas se
@@ -41,6 +61,13 @@ const MAX_PAGINAS = 100; // tope de seguridad: 100 * 100 = 10.000 registros
 // "esto ya lo conocía": si se olvidara antes de que la EUVD deje de devolverla,
 // la pasada siguiente la tomaría por nueva y volvería a ingerirla.
 const VISTAS_OLVIDO_DIAS = 14;
+
+// Cuánto hacia atrás se siembra lo que solo consta en VulnCheck. Son ~3.500 CVE
+// que la EUVD no marca, casi todas de hace años: pedir sus fichas una a una son
+// veinte minutos por pasada y triplicar la tabla con cosas que no son noticia.
+// Lo que hace falta es lo que acaba de entrar en el catálogo, que es lo único
+// que esNoticia() deja avisar; la ventana del feed da margen sobre esos 7 días.
+const VULNCHECK_SIEMBRA_DIAS = VENTANA_DIAS;
 const PAUSA_MS = 400; // 0,4 s entre peticiones, para no castigar la API
 const TIMEOUT_MS = 30000;
 const CONCURRENCIA_TITULOS = 6; // peticiones simultáneas a cve.org
@@ -563,6 +590,166 @@ async function pedirKev() {
 }
 
 /**
+ * El catálogo de VulnCheck KEV, como un mapa de CVE a su ficha.
+ *
+ * Se pagina porque no cabe de una vez, y una descarga a medias no vale: este
+ * catálogo no solo marca filas, decide qué sale por Telegram y con qué texto, así
+ * que media lista son avisos que no se mandan. Si falla una página se devuelve
+ * null y la pasada se queda sin avisar; en diez minutos hay otra.
+ *
+ * Se guarda la ficha entera y no solo la fecha porque de aquí sale el mensaje:
+ * ver mensajeTelegram(). Las fechas van en YYYY-MM-DD, como las de la EUVD, para
+ * que las dos se puedan comparar.
+ */
+async function pedirVulncheckKev() {
+  if (!VULNCHECK_TOKEN) {
+    log("VulnCheck: sin VULNCHECK_API_TOKEN, no pido el catálogo.");
+    return null;
+  }
+
+  const porCve = new Map();
+  let total = null;
+
+  for (let pagina = 1; pagina <= VULNCHECK_MAX_PAGINAS; pagina++) {
+    const url =
+      API_VULNCHECK_KEV +
+      "?" +
+      new URLSearchParams({ limit: String(VULNCHECK_PAGE), page: String(pagina) });
+    const respuesta = await pedir(url, { Authorization: `Bearer ${VULNCHECK_TOKEN}` });
+
+    if (respuesta === null) {
+      log(`VulnCheck: falló la página ${pagina}; me quedo sin catálogo esta pasada.`);
+      return null;
+    }
+
+    const datos = Array.isArray(respuesta.data) ? respuesta.data : [];
+    if (total === null) total = Number(respuesta?._meta?.total_documents ?? NaN);
+
+    for (const e of datos) {
+      const ficha = fichaVulncheck(e);
+      for (const cve of Array.isArray(e?.cve) ? e.cve : []) {
+        if (typeof cve !== "string" || cve === "") continue;
+        // Si un CVE aparece dos veces manda la ficha más antigua: lo que importa
+        // es desde cuándo consta explotado, que es lo que mira esNoticia().
+        const previa = porCve.get(cve);
+        if (previa?.fecha && (!ficha.fecha || previa.fecha <= ficha.fecha)) continue;
+        porCve.set(cve, ficha);
+      }
+    }
+
+    if (datos.length < VULNCHECK_PAGE) break;
+    await dormir(PAUSA_MS);
+  }
+
+  if (Number.isFinite(total) && total > VULNCHECK_MAX_PAGINAS * VULNCHECK_PAGE) {
+    log(
+      `VulnCheck: el catálogo tiene ${total} entradas y el tier community solo deja ` +
+        `bajar ${VULNCHECK_MAX_PAGINAS * VULNCHECK_PAGE}. Falta parte, y lo que falte no se avisa.`
+    );
+  }
+
+  log(`VulnCheck KEV: ${porCve.size} CVE explotadas en el catálogo`);
+  return porCve;
+}
+
+/**
+ * Una entrada del catálogo, con los nombres del feed. Es lo que acaba en el
+ * mensaje de Telegram, así que se queda con todo lo que el catálogo sabe y el
+ * resto de fuentes no: si CISA lo confirmó también y cuándo, si hay campañas de
+ * ransomware usándola, el plazo de parcheo y las pruebas de explotación.
+ */
+function fichaVulncheck(e) {
+  const soloDia = (v) => (typeof v === "string" && v !== "" ? v.slice(0, 10) : null);
+  const evidencias = (Array.isArray(e?.vulncheck_reported_exploitation) ? e.vulncheck_reported_exploitation : [])
+    .map((r) => r?.url)
+    .filter((u) => typeof u === "string" && /^https?:\/\//.test(u));
+
+  return {
+    fecha: soloDia(e?.date_added),
+    cisaFecha: soloDia(e?.cisa_date_added),
+    plazo: soloDia(e?.dueDate),
+    nombre: typeof e?.vulnerabilityName === "string" ? e.vulnerabilityName.trim() : "",
+    descripcion: typeof e?.shortDescription === "string" ? e.shortDescription.trim() : "",
+    accion: typeof e?.required_action === "string" ? e.required_action.trim() : "",
+    vendor: typeof e?.vendorProject === "string" ? e.vendorProject.trim() : "",
+    producto: typeof e?.product === "string" ? e.product.trim() : "",
+    cwes: (Array.isArray(e?.cwes) ? e.cwes : []).filter((c) => /^CWE-\d+$/.test(c)),
+    ransomware: e?.knownRansomwareCampaignUse === "Known",
+    canarios: e?.reported_exploited_by_vulncheck_canaries === true,
+    evidencias: [...new Set(evidencias)],
+  };
+}
+
+/**
+ * La puntuación, el vector, las CWE y la fecha de publicación de un CVE, del NVD
+ * que sirve el propio VulnCheck. Es lo único del mensaje que el catálogo de KEV
+ * no trae, y se pide de una en una porque solo hace falta para lo que se manda:
+ * con el filtro puesto son unos pocos por pasada, muy lejos de las 1.000
+ * peticiones por minuto que deja el tier community.
+ */
+async function pedirVulncheckNvd(cve) {
+  const url = API_VULNCHECK_NVD + "?" + new URLSearchParams({ cve });
+  const respuesta = await pedir(url, { Authorization: `Bearer ${VULNCHECK_TOKEN}` });
+  const ficha = Array.isArray(respuesta?.data) ? respuesta.data[0] : null;
+  if (!ficha) return null;
+
+  // De las métricas manda la versión más alta que traiga, y a igualdad la del
+  // asignador: es el mismo criterio con el que el NVD enseña una sola.
+  let mejor = null;
+  for (const [clave, lista] of Object.entries(ficha.metrics ?? {})) {
+    if (!clave.startsWith("cvssMetric") || !Array.isArray(lista)) continue;
+    for (const m of lista) {
+      const d = m?.cvssData;
+      const score = Number(d?.baseScore);
+      if (!Number.isFinite(score)) continue;
+
+      const version = Number.parseFloat(d.version ?? "0") || 0;
+      const primaria = m?.type === "Primary";
+      if (mejor && !(version > mejor.version || (version === mejor.version && primaria && !mejor.primaria))) continue;
+
+      // Los dos subíndices cuelgan de la métrica, no de cvssData, y se cogen de
+      // la misma que da el score: mezclarlos con los de otra sería sumar peras
+      // y manzanas. El CVSS 4.0 no los tiene, así que ahí se quedan en null.
+      mejor = {
+        version,
+        primaria,
+        score,
+        vector: typeof d.vectorString === "string" ? d.vectorString : null,
+        explotabilidad: Number.isFinite(Number(m?.exploitabilityScore)) ? Number(m.exploitabilityScore) : null,
+        impacto: Number.isFinite(Number(m?.impactScore)) ? Number(m.impactScore) : null,
+      };
+    }
+  }
+
+  const cwes = (Array.isArray(ficha.weaknesses) ? ficha.weaknesses : [])
+    .flatMap((w) => (Array.isArray(w?.description) ? w.description : []))
+    .map((d) => d?.value)
+    .filter((v) => typeof v === "string" && /^CWE-\d+$/.test(v));
+
+  return {
+    score: mejor?.score ?? null,
+    cvss: mejor ? String(mejor.version) : null,
+    vector: mejor?.vector ?? null,
+    explotabilidad: mejor?.explotabilidad ?? null,
+    impacto: mejor?.impacto ?? null,
+    // Sin recortar: el mensaje enseña también la hora. El NVD la publica en UTC
+    // y sin marca horaria, que es justo por lo que el mensaje lo dice.
+    publicado: typeof ficha.published === "string" ? ficha.published : null,
+    cwes: [...new Set(cwes)],
+  };
+}
+
+// Una sola petición por CVE y pasada: entre un envío y la edición del mismo
+// mensaje no hace falta volver a preguntar.
+const nvdVistas = new Map();
+
+async function datosVulncheckNvd(cve) {
+  if (typeof cve !== "string" || cve === "") return null;
+  if (!nvdVistas.has(cve)) nvdVistas.set(cve, await pedirVulncheckNvd(cve));
+  return nvdVistas.get(cve);
+}
+
+/**
  * Mete en el listado lo explotado que la ventana no alcanza.
  *
  * La búsqueda de la EUVD filtra por fecha de publicación, así que una CVE
@@ -580,8 +767,8 @@ async function pedirKev() {
  * La caché se poda con el catálogo, como las demás: lo que sale de KEV deja de
  * mantenerse y de publicarse, que es lo correcto —si CISA lo retira, aquí también.
  */
-async function sembrarKev(registros, entradas) {
-  if (!entradas) {
+async function sembrarKev(registros, entradas, vulncheck) {
+  if (!entradas && !vulncheck) {
     log("KEV: sin catálogo, no siembro nada fuera de ventana.");
     return;
   }
@@ -596,27 +783,50 @@ async function sembrarKev(registros, entradas) {
     if (fila.cve) enVentana.add(fila.cve);
   }
 
+  // La clave con la que se pide la ficha: el id de la EUVD para lo que trae su
+  // catálogo y el CVE para lo que solo trae VulnCheck, que no da ids de la EUVD.
+  // `/api/enisaid` acepta las dos cosas, así que a partir de aquí da igual de
+  // dónde venga cada una.
   const faltan = [];
-  for (const e of entradas) {
+  const pedidas = new Set();
+  for (const e of entradas ?? []) {
     const euvd = typeof e?.euvdId === "string" ? e.euvdId : null;
     if (!euvd || enVentana.has(euvd)) continue;
     if (typeof e?.cveId === "string" && enVentana.has(e.cveId)) continue;
     faltan.push(euvd);
+    pedidas.add(euvd);
+    if (typeof e?.cveId === "string") pedidas.add(e.cveId);
   }
 
-  const pendientes = faltan.filter((euvd) => !(euvd in cache));
+  // De lo que solo tiene VulnCheck se siembra lo recién añadido y nada más; ver
+  // VULNCHECK_SIEMBRA_DIAS. Sin esto, la mayoría de lo que VulnCheck marca antes
+  // que CISA no llegaría a Telegram: son CVE de hace meses o años, no las alcanza
+  // la ventana, y sin fila no hay aviso por muy explotadas que estén.
+  const desdeSiembra = Date.now() - VULNCHECK_SIEMBRA_DIAS * 86400000;
+  let deVulncheck = 0;
+  for (const [cve, ficha] of vulncheck ?? []) {
+    if (enVentana.has(cve) || pedidas.has(cve)) continue;
+    const entrada = Date.parse(ficha?.fecha ?? "");
+    if (Number.isNaN(entrada) || entrada < desdeSiembra) continue;
+    faltan.push(cve);
+    pedidas.add(cve);
+    deVulncheck++;
+  }
+
+  const pendientes = faltan.filter((clave) => !(clave in cache));
   log(
-    `KEV: ${faltan.length} explotadas fuera de la ventana, ` +
+    `KEV: ${faltan.length} explotadas fuera de la ventana ` +
+      `(${deVulncheck} solo en VulnCheck), ` +
       `${faltan.length - pendientes.length} en caché, ${pendientes.length} por pedir`
   );
 
   let hechas = 0;
-  for (const euvd of pendientes) {
-    const ficha = await pedir(API_ENISAID + "?" + new URLSearchParams({ id: euvd }));
+  for (const clave of pendientes) {
+    const ficha = await pedir(API_ENISAID + "?" + new URLSearchParams({ id: clave }));
     const fila = ficha ? normalizar(ficha) : null;
     // Los fallos no se cachean: se reintentan en la pasada siguiente, igual que
     // en completarMeta(). Una ficha que no baja hoy baja dentro de diez minutos.
-    if (fila) cache[euvd] = fila;
+    if (fila) cache[clave] = fila;
     if (++hechas % 50 === 0) log(`  ${hechas}/${pendientes.length} fichas de la EUVD`);
     await dormir(PAUSA_MS);
   }
@@ -624,16 +834,16 @@ async function sembrarKev(registros, entradas) {
   // Poda: la caché se queda solo con lo que sigue en el catálogo.
   const vigentes = {};
   let sembradas = 0;
-  for (const euvd of faltan) {
-    const fila = cache[euvd];
+  for (const clave of faltan) {
+    const fila = cache[clave];
     if (!fila) continue;
 
-    vigentes[euvd] = fila;
+    vigentes[clave] = fila;
     // La marca es lo que distingue una fila traída por el catálogo de una traída
     // por la ventana. La usa notificarTelegram() para no vaciar el catálogo
     // entero en la sala de KEV la primera vez, y sale en el JSON porque es una
     // diferencia real: esta fila está aquí por estar explotada, no por reciente.
-    registros.set(euvd, { ...fila, fueraDeVentana: true });
+    registros.set(fila.euvd, { ...fila, fueraDeVentana: true });
     sembradas++;
   }
 
@@ -642,32 +852,50 @@ async function sembrarKev(registros, entradas) {
 }
 
 /** Marca con la fecha y las fuentes del catálogo las filas que están en él. */
-function completarKev(filas, entradas) {
-  if (!entradas) {
+function completarKev(filas, entradas, vulncheck) {
+  if (!entradas && !vulncheck) {
     log("KEV: sin catálogo, las filas se quedan sin marcar.");
     return;
   }
 
   const porCve = new Map();
   const porEuvd = new Map();
-  for (const e of entradas) {
+  for (const e of entradas ?? []) {
     if (typeof e?.cveId === "string") porCve.set(e.cveId, e);
     if (typeof e?.euvdId === "string") porEuvd.set(e.euvdId, e);
   }
 
   let marcadas = 0;
+  let conVulncheck = 0;
   for (const fila of filas) {
     const kev = (fila.cve && porCve.get(fila.cve)) || porEuvd.get(fila.euvd);
-    if (!kev) continue;
+    // El catálogo de VulnCheck va por CVE: una fila sin CVE no se puede cruzar.
+    const vc = fila.cve && vulncheck?.has(fila.cve) ? vulncheck.get(fila.cve) : undefined;
+    if (!kev && vc === undefined) continue;
+
+    const fuentes = Array.isArray(kev?.sources) ? [...kev.sources] : [];
+    if (vc !== undefined) fuentes.push("vulncheck_kev");
+
+    // De las dos fechas manda la más antigua: lo que importa es desde cuándo
+    // consta explotada, no cuál de los dos catálogos se enteró el último. Es la
+    // que mira esNoticia() para decidir si el primer aviso todavía es noticia.
+    const fechas = [
+      typeof kev?.dateAdded === "string" ? kev.dateAdded.slice(0, 10) : null,
+      vc?.fecha ?? null,
+    ].filter((f) => typeof f === "string" && f !== "");
 
     fila.kev = {
-      fecha: typeof kev.dateAdded === "string" ? kev.dateAdded : null,
-      fuentes: Array.isArray(kev.sources) ? kev.sources : [],
+      fecha: fechas.length ? fechas.sort()[0] : null,
+      fuentes,
     };
     marcadas++;
+    if (vc !== undefined) conVulncheck++;
   }
 
-  log(`${marcadas} de ${filas.length} filas explotadas activamente (KEV tiene ${entradas.length})`);
+  log(
+    `${marcadas} de ${filas.length} filas explotadas activamente ` +
+      `(${conVulncheck} confirmadas por VulnCheck, que es lo que llega a Telegram)`
+  );
 }
 
 // ---------------------------------------------------------------- normalización
@@ -732,6 +960,21 @@ const prioridadSala = (sala) => TG_ORDEN.indexOf(sala);
 const salaDe = (fila) => (fila.kev ? "kev" : fila.severidad);
 
 /**
+ * El filtro de Telegram: solo sale por el grupo lo que VulnCheck KEV da por
+ * explotado. Todo lo demás sigue en la web —la tabla no cambia— pero no genera
+ * mensajes, que es lo que se pidió: el grupo deja de ser un boletín de novedades
+ * y pasa a ser la lista de lo que hay que parchear ya.
+ *
+ * Como todo lo que pasa este filtro tiene `kev`, salaDe() lo manda a la sala de
+ * KEV: las salas por criticidad se quedan mudas mientras el filtro esté puesto.
+ */
+const esVulncheckKev = (fila) => (fila.kev?.fuentes ?? []).includes("vulncheck_kev");
+
+/** La ficha del catálogo de VulnCheck de una fila, que es de donde sale su mensaje. */
+const fichaDe = (fila, vulncheck) =>
+  typeof fila.cve === "string" ? (vulncheck?.get(fila.cve) ?? null) : null;
+
+/**
  * Si el primer aviso de una fila todavía es una noticia.
  *
  * Lo que trae la ventana lo es por definición: son catorce días de
@@ -774,7 +1017,28 @@ const firmaCorta = (texto) => createHash("sha1").update(texto, "utf8").digest("h
  * por bandas, así que el mensaje enseña el número exacto del día en que se editó
  * pero un vaivén del 0,08 al 0,09 % no dispara una edición.
  */
-function firmaFila(fila, sala) {
+function firmaFila(fila, sala, vc = null) {
+  // La ficha de VulnCheck va en la firma porque es de donde sale el texto del
+  // mensaje: sin ella, cambiar el nombre o el plazo en el catálogo no reeditaría
+  // nada. La puntuación no entra —se pide aparte, y solo de lo que se manda—,
+  // pero el score de la EUVD sí sigue estando, así que un reanálisis mueve la
+  // firma igual y el mensaje se pone al día con él.
+  const deVulncheck = vc
+    ? [
+        vc.fecha ?? "",
+        vc.cisaFecha ?? "",
+        vc.plazo ?? "",
+        vc.nombre ?? "",
+        vc.descripcion ?? "",
+        vc.accion ?? "",
+        vc.vendor ?? "",
+        vc.producto ?? "",
+        (vc.cwes ?? []).join(","),
+        vc.ransomware ? "R" : "",
+        vc.canarios ? "C" : "",
+      ].join("\u0002")
+    : "";
+
   return firmaCorta(
     [
       sala,
@@ -787,6 +1051,7 @@ function firmaFila(fila, sala) {
       fila.vendor ?? "",
       fila.producto ?? "",
       fila.fecha ?? "",
+      deVulncheck,
     ].join("\u0001")
   );
 }
@@ -846,9 +1111,6 @@ const TG_MARCA = {
   sin_puntuar: "\u{26AA} UNSCORED",
 };
 
-/** Los catálogos se identifican con su nombre, no con la clave de la API. */
-const TG_FUENTE_KEV = { cisa_kev: "CISA KEV", eukev_kev: "EU KEV" };
-
 // La descripción va en una cita: por encima de TG_DESC_PLEGABLE, Telegram la
 // pliega y deja el resto del mensaje a la vista. El tope duro existe porque hay
 // descripciones de 4.000 caracteres y un mensaje entero no puede pasar de 4.096.
@@ -857,10 +1119,40 @@ const TG_DESC_MAX = 3000;
 
 const TG_CWE_VISIBLES = 3; // el mismo tope que la tabla; el resto va como "+n"
 
+// A cuánto llega cada subíndice, que es lo que los hace legibles: un 1.8 de
+// explotabilidad no dice nada, un "1.8 / 3.9" dice que cuesta explotarla. Los
+// topes no son los mismos en cada versión del CVSS —la 2.0 puntúa los dos sobre
+// 10— y la 4.0 no publica subíndices, así que ahí no sale la línea.
+const TG_CVSS_TOPES = {
+  "2.0": { explotabilidad: 10, impacto: 10 },
+  "3.0": { explotabilidad: 3.9, impacto: 6 },
+  "3.1": { explotabilidad: 3.9, impacto: 6 },
+};
+
+// La acción recomendada es plantilla —19 textos distintos para 1.000 entradas—
+// pero las hay de 520 caracteres. El tope está para que una futura más larga no
+// se coma el margen hasta los 4.096 de un mensaje.
+const TG_ACCION_MAX = 600;
+
+// Las referencias con las que VulnCheck sostiene que se está explotando: unas
+// son el informe de quien lo vio, otras el aviso del fabricante. Son las únicas
+// que lleva el mensaje. El catálogo trae 32 de media por CVE, así que se cortan
+// en dos —con eso ya se puede verificar— y el resto se resume en un "+n".
+const TG_EVIDENCIAS_VISIBLES = 2;
+
 /**
  * Un mensaje por vulnerabilidad, en cuatro bloques: cabecera con lo que se ve en
  * la notificación del móvil (criticidad, puntuación e identificador), título,
- * la alerta de explotación si la hay, los datos etiquetados y los enlaces.
+ * la alerta de explotación, los datos etiquetados y los enlaces.
+ *
+ * **Todo lo que dice sale de VulnCheck**: `vc` es su ficha del catálogo de KEV
+ * —nombre, descripción, fabricante, producto, CWE, fechas, ransomware, plazo y
+ * pruebas de explotación— y `nvd` es la puntuación y la fecha de publicación,
+ * del NVD que sirve el propio VulnCheck. La fila solo pone el identificador.
+ *
+ * Eso deja fuera la EPSS, que la sirve FIRST y VulnCheck no: en un mensaje que
+ * solo sale de lo ya explotado tampoco pintaba mucho una probabilidad de que
+ * llegue a explotarse. La tabla la sigue enseñando.
  *
  * El identificador va en <code> para que Telegram lo ponga en monoespaciada y
  * se pueda copiar tocándolo, que es lo primero que se hace con un CVE.
@@ -873,7 +1165,7 @@ const TG_CWE_VISIBLES = 3; // el mismo tope que la tabla; el resto va como "+n"
  * eso un mensaje cambiaría de contenido sin que se note: Telegram no marca de
  * ninguna manera los mensajes que edita un bot.
  */
-function mensajeTelegram(fila, previa = null, actualizado = null) {
+function mensajeTelegram(fila, vc = null, nvd = null, previa = null, actualizado = null) {
   const lineas = [];
 
   if (previa) {
@@ -888,30 +1180,36 @@ function mensajeTelegram(fila, previa = null, actualizado = null) {
     lineas.push(`${marca} — previously reported as ${antes}${cuando}`, "");
   }
 
-  const marca = TG_MARCA[fila.severidad] ?? TG_MARCA.sin_puntuar;
-  // El 0 de la EUVD es un hueco, no una puntuación: la cabecera se queda con la
-  // marca de "Unscored" a secas, sin un CVSS 0.0 que nadie ha puesto.
-  const puntuacion = fila.score > 0 ? ` · CVSS <b>${fila.score.toFixed(1)}</b>` : "";
+  // El score del NVD que sirve VulnCheck; la severidad, del mismo corte que usa
+  // la tabla, para que la marca de la cabecera diga lo mismo que el número.
+  const score = typeof nvd?.score === "number" ? nvd.score : null;
+  const marca = TG_MARCA[severidad(score)] ?? TG_MARCA.sin_puntuar;
+  // Sin puntuación la cabecera se queda con la marca a secas: un CVSS 0.0 que
+  // nadie ha puesto sería peor que no decir nada.
+  const puntuacion = score > 0 ? ` · CVSS <b>${score.toFixed(1)}</b>` : "";
   lineas.push(`${marca}${puntuacion} · <code>${escaparHtml(fila.cve ?? fila.euvd)}</code>`);
 
   // La descripción trae saltos de línea a media frase, así que se normaliza.
-  const descripcion = String(fila.descripcion ?? "").replace(/\s+/g, " ").trim();
+  const descripcion = String(vc?.descripcion ?? "").replace(/\s+/g, " ").trim();
 
-  // Cuando cve.org no tiene título, `nombre` es el primer trozo de la propia
-  // descripción —una de cada cuatro filas—: repetirlo sería enseñar dos veces la
-  // misma frase, así que ahí manda la descripción, que además viene entera.
-  const titulo = fila.nombre === "Sin descripción" ? "" : String(fila.nombre ?? "");
+  // El catálogo trae las dos cosas, pero a veces el nombre es el primer trozo de
+  // la descripción: repetirlo sería enseñar dos veces la misma frase.
+  const titulo = String(vc?.nombre ?? "").trim();
   if (titulo && !descripcion.startsWith(titulo.replace(/…$/, "").trim())) {
     lineas.push(`<b>${escaparHtml(titulo)}</b>`);
   }
 
-  if (fila.kev) {
-    const fuentes = (fila.kev.fuentes ?? [])
-      .map((f) => TG_FUENTE_KEV[f] ?? String(f).toUpperCase())
-      .join(" · ");
-    const desde = typeof fila.kev.fecha === "string" ? `, added ${fila.kev.fecha.slice(0, 10)}` : "";
-    lineas.push("", `\u{26A0}\u{FE0F} <b>Actively exploited</b>${fuentes ? ` — ${escaparHtml(fuentes)}` : ""}${desde}`);
-  }
+  // La alerta sale entera de la ficha de VulnCheck: su fecha, y la de CISA si
+  // además la confirmó, que el propio catálogo trae en `cisa_date_added`.
+  const fuentes = ["VulnCheck KEV", ...(vc?.cisaFecha ? ["CISA KEV"] : [])].join(" · ");
+  const desde = vc?.fecha ? `, added ${vc.fecha}` : "";
+  lineas.push("", `\u{26A0}\u{FE0F} <b>Actively exploited</b> — ${escaparHtml(fuentes)}${desde}`);
+
+  // Las dos cosas que separan lo urgente de lo muy urgente, y que no las da
+  // ningún otro catálogo: si hay ransomware usándola y si la han visto entrar
+  // en los señuelos de VulnCheck.
+  if (vc?.ransomware) lineas.push("\u{1F513} <b>Known ransomware campaign use</b>");
+  if (vc?.canarios) lineas.push("\u{1F4E1} Exploitation seen by VulnCheck canaries");
 
   if (descripcion) {
     const recortada =
@@ -926,22 +1224,18 @@ function mensajeTelegram(fila, previa = null, actualizado = null) {
   // que es mejor que una fila con un guion.
   const datos = [];
 
-  if (fila.vendor) datos.push(`<b>Vendor:</b> ${escaparHtml(fila.vendor)}`);
-  if (fila.producto && fila.producto !== fila.vendor) {
-    datos.push(`<b>Product:</b> ${escaparHtml(fila.producto)}`);
-  }
-
-  if (fila.epss != null) {
-    const probabilidad = (fila.epss * 100).toFixed(1);
-    const percentil =
-      fila.epssPercentil != null ? ` (percentile ${Math.round(fila.epssPercentil * 100)})` : "";
-    datos.push(`<b>EPSS:</b> ${probabilidad}%${percentil}`);
+  if (vc?.vendor) datos.push(`<b>Vendor:</b> ${escaparHtml(vc.vendor)}`);
+  if (vc?.producto && vc.producto !== vc.vendor) {
+    datos.push(`<b>Product:</b> ${escaparHtml(vc.producto)}`);
   }
 
   // Enlazadas a cwe.mitre.org, igual que en la tabla, y con el mismo tope de tres
   // visibles y un "+n" con el resto: en un mensaje de móvil, seis identificadores
   // seguidos ocupan más que todo lo demás junto.
-  const cwes = (fila.cwes ?? []).map((c) => c?.id).filter((id) => /^CWE-\d+$/.test(id));
+  //
+  // Manda las del catálogo de KEV, que van a la causa de lo que se está
+  // explotando; las del NVD entran solo si el catálogo no trae ninguna.
+  const cwes = (vc?.cwes?.length ? vc.cwes : (nvd?.cwes ?? [])).filter((id) => /^CWE-\d+$/.test(id));
   if (cwes.length) {
     const enlazadas = cwes
       .slice(0, TG_CWE_VISIBLES)
@@ -951,20 +1245,59 @@ function mensajeTelegram(fila, previa = null, actualizado = null) {
     datos.push(`<b>CWE:</b> ${enlazadas}${resto > 0 ? ` +${resto}` : ""}`);
   }
 
-  if (fila.fecha) datos.push(`<b>Published:</b> ${fila.fecha.slice(0, 10)}`);
+  // Los dos subíndices en una línea, cada uno contra su tope. Separan dos cosas
+  // que el score junta: lo fácil que es llegar y lo que se lleva por delante.
+  const topes = TG_CVSS_TOPES[nvd?.cvss ?? ""];
+  if (topes && (nvd.explotabilidad != null || nvd.impacto != null)) {
+    const partes = [];
+    if (nvd.explotabilidad != null) {
+      partes.push(`<b>Exploitability:</b> ${nvd.explotabilidad.toFixed(1)} / ${topes.explotabilidad.toFixed(1)}`);
+    }
+    if (nvd.impacto != null) {
+      partes.push(`<b>Impact:</b> ${nvd.impacto.toFixed(1)} / ${topes.impacto.toFixed(1)}`);
+    }
+    datos.push(partes.join(" · "));
+  }
+
+  // Con hora y diciendo que es UTC: el NVD la publica sin marca horaria, y una
+  // fecha a secas hace pensar que la vulnerabilidad lleva un día entero fuera
+  // cuando puede llevar veinte minutos.
+  if (nvd?.publicado) {
+    const dia = nvd.publicado.slice(0, 10);
+    const hora = nvd.publicado.slice(11, 16);
+    datos.push(`<b>Published:</b> ${dia}${/^\d{2}:\d{2}$/.test(hora) ? ` ${hora} UTC` : ""}`);
+  }
+  // El plazo de CISA, que el catálogo de VulnCheck arrastra. En una lista de cosas
+  // que ya se están explotando es el único dato con una fecha límite de verdad.
+  if (vc?.plazo) datos.push(`<b>Patch by:</b> ${vc.plazo}`);
 
   if (datos.length) lineas.push("", ...datos);
 
-  // El primer enlace es la ficha de la EUVD, que es de donde sale el CVSS del
-  // mensaje. Antes iba al NVD, y mandar a una ficha que puntuaba otra cosa —o que
-  // sigue en "Awaiting Analysis"— era justo lo que hacía dudar del número.
-  const enlaces = [
-    `<a href="https://euvd.enisa.europa.eu/vulnerability/${escaparHtml(fila.euvd)}">EUVD</a>`,
-  ];
-  if (fila.cve) {
-    enlaces.push(`<a href="https://www.cve.org/CVERecord?id=${escaparHtml(fila.cve)}">CVE Record</a>`);
+  // Lo que el catálogo dice que hay que hacer. Va después de los datos y antes de
+  // los enlaces porque es la conclusión del mensaje: lo de arriba explica por qué
+  // corre prisa y esto dice qué se hace con ello.
+  const accion = String(vc?.accion ?? "").replace(/\s+/g, " ").trim();
+  if (accion) {
+    const recortada =
+      accion.length > TG_ACCION_MAX
+        ? accion.slice(0, TG_ACCION_MAX).replace(/\s+\S*$/, "") + "…"
+        : accion;
+    lineas.push("", `\u{1F6E0}\u{FE0F} <b>Required action:</b> ${escaparHtml(recortada)}`);
   }
-  lineas.push("", enlaces.join(" · "));
+
+  // La línea de abajo son las referencias de VulnCheck y nada más. Ni la ficha de
+  // la EUVD —iba primera por ser de donde salía el CVSS, y el CVSS ya no sale de
+  // ahí— ni el registro del CVE: el identificador está arriba en monoespaciada,
+  // que es lo que se copia, y lo que se abre desde el mensaje es lo que justifica
+  // el aviso. El "+n" dice cuántas más hay, igual que en las CWE.
+  const evidencias = vc?.evidencias ?? [];
+  if (evidencias.length) {
+    const enlaces = evidencias
+      .slice(0, TG_EVIDENCIAS_VISIBLES)
+      .map((url, i) => `<a href="${escaparHtml(url)}">Evidence${i > 0 ? ` ${i + 1}` : ""}</a>`);
+    const resto = evidencias.length - TG_EVIDENCIAS_VISIBLES;
+    lineas.push("", enlaces.join(" · ") + (resto > 0 ? ` +${resto}` : ""));
+  }
 
   if (actualizado) lineas.push("", `<i>Updated ${actualizado.slice(0, 16).replace("T", " ")} UTC</i>`);
 
@@ -1095,11 +1428,20 @@ async function telegramBorrar(chat, mensaje) {
  * Va después de escribir el JSON a propósito: que Telegram no conteste no puede
  * dejar la web sin actualizar.
  */
-async function notificarTelegram(filas, registroSembrado = null) {
+async function notificarTelegram(filas, registroSembrado = null, vulncheck = null) {
   const salasConfiguradas = Object.values(TG_SALAS).filter(Boolean).length;
 
   if (!TG_TOKEN || (!TG_CHAT && salasConfiguradas === 0)) {
     log("Telegram: sin TELEGRAM_BOT_TOKEN o sin ningún chat configurado, no aviso.");
+    return;
+  }
+
+  // Sin el catálogo de VulnCheck no se puede decidir qué avisar, así que no se
+  // avisa: la pasada se va sin tocar Telegram y sin escribir el estado. Escribirlo
+  // sería peor que no hacer nada — lo de hoy quedaría anotado como visto y su
+  // aviso se perdería para siempre. En diez minutos hay otra pasada.
+  if (!vulncheck) {
+    log("Telegram: sin catálogo de VulnCheck no sé qué avisar; esta pasada no toco nada.");
     return;
   }
 
@@ -1168,7 +1510,7 @@ async function notificarTelegram(filas, registroSembrado = null) {
     for (const fila of filas) {
       const sala = salaDe(fila);
       const previa = vigentes[fila.euvd] ?? null;
-      const firma = firmaFila(fila, sala);
+      const firma = firmaFila(fila, sala, fichaDe(fila, vulncheck));
       vigentes[fila.euvd] =
         previa && typeof previa === "object"
           ? { ...previa, visto: ahora, firma }
@@ -1195,7 +1537,7 @@ async function notificarTelegram(filas, registroSembrado = null) {
         fecha: ahora,
         visto: ahora,
         enviada: false,
-        firma: firmaFila(fila, sala),
+        firma: firmaFila(fila, sala, fichaDe(fila, vulncheck)),
       };
     }
 
@@ -1217,8 +1559,24 @@ async function notificarTelegram(filas, registroSembrado = null) {
   for (const fila of filas) {
     const sala = salaDe(fila);
     const previa = vigentes[fila.euvd] ?? null;
-    const firma = firmaFila(fila, sala);
+    const vc = fichaDe(fila, vulncheck);
+    const firma = firmaFila(fila, sala, vc);
     const destino = destinoDe(sala, fila);
+
+    // El filtro: lo que VulnCheck no da por explotado se anota y ahí se queda.
+    // No se envía, no se edita y no se mueve de sala.
+    //
+    // Tampoco se borra lo que se publicó antes de poner el filtro: esos mensajes
+    // se quedan donde están y su apunte se cae solo en TG_OLVIDO_DIAS. Borrarlos
+    // sería un barrido de cientos de mensajes que nadie ha pedido, y el grupo
+    // queda limpio igual en dos semanas sin tocar nada.
+    if (!esVulncheckKev(fila)) {
+      vigentes[fila.euvd] =
+        previa && typeof previa === "object"
+          ? { ...previa, visto: ahora, firma }
+          : { sala, fecha: ahora, visto: ahora, enviada: false, firma };
+      continue;
+    }
 
     // La siembra del catálogo: solo la primera vez y solo lo que entra por él.
     // Lo que ya estaba anotado sigue su camino normal, incluidas las ediciones.
@@ -1239,7 +1597,7 @@ async function notificarTelegram(filas, registroSembrado = null) {
     // Ya anotada y sigue en su sala: como mucho, una edición silenciosa.
     if (previa && previa.sala === sala) {
       if (previa.firma === firma) continue;
-      if (previa.enviada && previa.mensaje) ediciones.push({ fila, sala, previa, firma });
+      if (previa.enviada && previa.mensaje) ediciones.push({ fila, sala, previa, firma, vc });
       else vigentes[fila.euvd] = { ...previa, firma };
       continue;
     }
@@ -1247,12 +1605,12 @@ async function notificarTelegram(filas, registroSembrado = null) {
     // Sin sala montada: se anota y no se vuelve a mirar mientras no cambie de
     // sala. Si venía publicada de otra, se borra: allí ya no pinta nada.
     if (!destino) {
-      if (previa?.mensaje) envios.push({ fila, sala, destino: "", previa, firma, soloBorrar: true });
+      if (previa?.mensaje) envios.push({ fila, sala, destino: "", previa, firma, vc, soloBorrar: true });
       else vigentes[fila.euvd] = { sala, fecha: ahora, visto: ahora, enviada: false, firma };
       continue;
     }
 
-    envios.push({ fila, sala, destino, previa, firma, soloBorrar: false });
+    envios.push({ fila, sala, destino, previa, firma, vc, soloBorrar: false });
   }
 
   if (envios.length === 0 && ediciones.length === 0) {
@@ -1286,7 +1644,7 @@ async function notificarTelegram(filas, registroSembrado = null) {
   let editadas = 0;
   let cortado = false;
 
-  for (const { fila, sala, destino, previa, firma, soloBorrar } of envios) {
+  for (const { fila, sala, destino, previa, firma, vc, soloBorrar } of envios) {
     // El tope es por sala: el límite de Telegram es por chat, así que un atasco en
     // medias no tiene por qué retrasar el aviso de una crítica.
     const cupo = (enviadas[sala] ?? 0) + 1;
@@ -1298,7 +1656,9 @@ async function notificarTelegram(filas, registroSembrado = null) {
       // El encabezado de mudanza solo tiene sentido si de la anterior se llegó a
       // avisar; si no, para quien lo lee es un mensaje nuevo y punto.
       await ritmo();
-      const texto = mensajeTelegram(fila, previa?.enviada ? previa : null);
+      // La puntuación se pide aquí y no antes: solo hace falta para lo que de
+      // verdad se manda, que con el filtro puesto son unos pocos por pasada.
+      const texto = mensajeTelegram(fila, vc, await datosVulncheckNvd(fila.cve), previa?.enviada ? previa : null);
       const { enviado, esperar, chat, mensaje } = await telegramEnviar(destino, texto);
 
       if (!enviado) {
@@ -1334,14 +1694,15 @@ async function notificarTelegram(filas, registroSembrado = null) {
   // Las ediciones, al final: no notifican a nadie, así que si la pasada se queda
   // sin tiempo o sin cupo, lo justo es que cedan el turno a los avisos.
   if (!cortado) {
-    for (const { fila, sala, previa, firma } of ediciones) {
+    for (const { fila, sala, previa, firma, vc } of ediciones) {
       if (editadas >= TG_MAX_EDICIONES) break; // el resto, en la siguiente pasada
 
       await ritmo();
+      const nvd = await datosVulncheckNvd(fila.cve);
       const { hecha, esperar, perdido } = await telegramEditar(
         previa.chat,
         previa.mensaje,
-        mensajeTelegram(fila, null, ahora)
+        mensajeTelegram(fila, vc, nvd, null, ahora)
       );
 
       if (!hecha) {
@@ -1597,7 +1958,8 @@ if (totalApi && registros.size < totalApi) {
 // del NVD sí se las pierde —esas se piden por ventana de publicación—, pero la
 // fuente principal de CWE es cve.org y el NVD solo es el respaldo.
 const entradasKev = await pedirKev();
-await sembrarKev(registros, entradasKev);
+const vulncheckKev = await pedirVulncheckKev();
+await sembrarKev(registros, entradasKev, vulncheckKev);
 
 const filas = [...registros.values()].sort((a, b) =>
   String(b.fecha).localeCompare(String(a.fecha))
@@ -1606,7 +1968,7 @@ const filas = [...registros.values()].sort((a, b) =>
 await completarMeta(filas);
 await completarCwesNvd(filas);
 await completarEpss(filas);
-completarKev(filas, entradasKev);
+completarKev(filas, entradasKev, vulncheckKev);
 
 // Se filtra al final, con las filas ya enriquecidas y en un solo sitio: lo que
 // salga de aquí es lo que se publica y lo único de lo que Telegram llega a
@@ -1628,7 +1990,7 @@ const salida = {
   fuente: "EU Vulnerability Database (ENISA)",
   fuenteScore: "EU Vulnerability Database (ENISA)",
   fuenteEpss: "EPSS de FIRST",
-  fuenteKev: "CISA KEV y EU KEV, vía EUVD",
+  fuenteKev: "VulnCheck KEV, más CISA KEV y EU KEV vía EUVD",
   fuenteCwe: "cve.org, con el NVD de respaldo",
   items: publicables,
 };
@@ -1640,4 +2002,4 @@ log(
     `(${RAPIDO ? "pasada rápida" : "pasada completa"})`
 );
 
-await notificarTelegram(publicables, registro.sembrado ?? null);
+await notificarTelegram(publicables, registro.sembrado ?? null, vulncheckKev);

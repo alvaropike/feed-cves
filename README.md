@@ -3,10 +3,13 @@
 Tabla web con las CVE publicadas recientemente: CVE, nombre, fabricante, CWE, criticidad,
 EPSS y fecha. Fuentes: EU Vulnerability Database de ENISA para el listado y la puntuación
 CVSS, cve.org para el título oficial y las CWE de cada CVE —con el NVD del NIST de
-respaldo para las CWE—, FIRST para la EPSS y los catálogos CISA KEV / EU KEV para marcar
-lo que ya se está explotando.
-Opcionalmente avisa por Telegram, con una sala por criticidad y otra para lo que ya se
-está explotando; ver más abajo.
+respaldo para las CWE—, FIRST para la EPSS y los catálogos VulnCheck KEV, CISA KEV y
+EU KEV para marcar lo que ya se está explotando.
+
+Opcionalmente avisa por Telegram, y ahí manda **VulnCheck y solo VulnCheck**: solo se avisa
+de lo que su catálogo da por explotado, y todo lo que dice el mensaje sale de sus dos
+índices. La web enseña los catorce días enteros con todas las fuentes; el grupo, solo lo que
+hay que parchear ya. Ver más abajo.
 
 ## Por qué no se llama a la API desde el navegador
 
@@ -90,6 +93,7 @@ Los secretos van en Settings → Secrets and variables → Actions:
 |---|---|
 | `FTP_HOST`, `FTP_USER`, `FTP_PASSWORD` | publicar el resultado |
 | `NVD_API_KEY` | opcional; sube el límite del NVD de 5 a 50 peticiones/30 s |
+| `VULNCHECK_API_TOKEN` | de lo que sale por Telegram: qué se avisa y con qué texto. Sin él la web sale igual pero no se avisa nada |
 | `TELEGRAM_BOT_TOKEN` | opcional; sin él el sync corre igual y no avisa |
 | `TELEGRAM_CHAT_KEV`, `_CRITICAS`, `_ALTAS`, `_MEDIAS`, `_BAJAS`, `_SIN_PUNTUAR` | una sala por criticidad; ver "Avisos por Telegram" |
 | `TELEGRAM_CHAT_AVISOS` | opcional; sala de guardia para los fallos de la pasada, ver "Cuando algo se rompe" |
@@ -238,19 +242,57 @@ Construir en Actions y subir solo lo construido evita las dos cosas.
 
 ## Avisos por Telegram
 
-El sync avisa por Telegram según van apareciendo vulnerabilidades, **cada una a la sala que
-le toca**. Es solo de salida: no hay bot a la escucha, ni webhook, ni proceso extra que
-mantener — el mismo cron que actualiza la web hace un POST a `api.telegram.org` cuando
-encuentra algo nuevo.
+El sync avisa por Telegram según van apareciendo vulnerabilidades. Es solo de salida: no hay
+bot a la escucha, ni webhook, ni proceso extra que mantener — el mismo cron que actualiza la
+web hace un POST a `api.telegram.org` cuando encuentra algo nuevo.
+
+### Todo sale de VulnCheck
+
+Telegram va contra una sola fuente, y es VulnCheck. Dos cosas, que son independientes:
+
+**Qué se avisa.** Al grupo solo llega lo que **VulnCheck KEV** da por explotado. Todo lo
+demás sigue en la web —la tabla no cambia— pero no genera mensajes. Es el cambio que
+convierte el grupo en otra cosa: de un boletín de 350 novedades al día a la lista de lo que
+hay que parchear ya, que en una ventana real es **un puñado a la semana**.
+
+**Qué dice el mensaje.** El texto no mezcla fuentes: el nombre, la descripción, el
+fabricante, el producto, las CWE, las fechas, el ransomware, el plazo y las pruebas de
+explotación salen de la ficha de VulnCheck KEV, y la puntuación y la fecha de publicación
+del NVD que sirve el propio VulnCheck (`nist-nvd2`). Ver "Qué llega".
+
+Se eligió VulnCheck y no CISA porque es el mismo dato pero antes y más ancho: 5.200 entradas
+frente a las 1.700 de CISA KEV y EU KEV juntas, ninguna de las cuales falta aquí, y con la
+fecha de confirmación uno o dos días por delante. Lo caro de una vulnerabilidad explotada es
+enterarse tarde.
+
+Lo que el filtro deja fuera **se anota igual**, con su firma y su sala, así que el día que lo
+quites no te caen encima las dos semanas acumuladas: solo llega lo que aparezca a partir de
+entonces. Y lo que se publicó antes de ponerlo no se borra: esos mensajes se quedan donde
+están y su apunte se cae solo en `TG_OLVIDO_DIAS`, así que el grupo queda limpio en dos
+semanas sin un barrido de cientos de borrados.
+
+Sin `VULNCHECK_API_TOKEN`, o si el catálogo no baja, **la pasada no toca Telegram** y no
+escribe el estado. Es a propósito: sin catálogo no se puede decidir qué avisar, y anotar lo
+de hoy como visto sería perder su aviso para siempre. En diez minutos hay otra pasada.
+
+Para quitar el filtro y volver al boletín completo, borra la llamada a `esVulncheckKev()` de
+`notificarTelegram()` (`es_vulncheck_kev()` en el PHP): el resto del reparto por salas sigue
+montado y vuelve a funcionar solo. El mensaje seguiría saliendo de VulnCheck, así que lo que
+no esté en su catálogo iría sin datos; para eso hay que revertir `mensajeTelegram()` también.
 
 ### Las salas
 
 Seis, por criticidad, más la de lo que ya se está explotando. Cada una es un grupo o canal
-de Telegram, y **la sala que no tenga chat asignado no recibe nada**:
+de Telegram, y **la sala que no tenga chat asignado no recibe nada**.
+
+Con el filtro de VulnCheck puesto, todo lo que se manda está explotado, y KEV manda sobre la
+puntuación: **el reparto acaba entero en `TELEGRAM_CHAT_KEV` y las otras cinco se quedan
+mudas**. Siguen montadas y vuelven a llenarse solas el día que quites el filtro; la columna
+"al día" es lo que recibiría cada una sin él:
 
 | variable | qué recibe | al día |
 |---|---|---|
-| `TELEGRAM_CHAT_KEV` | consta en CISA KEV o EU KEV | 1 |
+| `TELEGRAM_CHAT_KEV` | consta explotada (con el filtro, todo lo que se manda) | 1 |
 | `TELEGRAM_CHAT_CRITICAS` | CVSS ≥ 9.0 | 48 |
 | `TELEGRAM_CHAT_ALTAS` | CVSS 7.0 – 8.9 | 134 |
 | `TELEGRAM_CHAT_MEDIAS` | CVSS 4.0 – 6.9 | 123 |
@@ -328,23 +370,68 @@ bot serían miles de mensajes de cosas de hace dos semanas.
 Un mensaje por vulnerabilidad, con lo justo para decidir sin abrir el enlace:
 
 ```
-🔴 CRITICAL · CVSS 9.8 · CVE-2026-60004
-Gitea allows remote code execution via the diffpatch API
+🔴 CRITICAL · CVSS 9.3 · CVE-2026-9586
+Sangoma Switchvox SQL Injection Vulnerability
 
-⚠️ Actively exploited — CISA KEV · EU KEV, added 2026-08-26
+⚠️ Actively exploited — VulnCheck KEV · CISA KEV, added 2026-09-01
+🔓 Known ransomware campaign use
+📡 Exploitation seen by VulnCheck canaries
 
-▎Gitea before 1.27.1 allows remote code execution via the diffpatch
-▎API through Git hook installation. Exploitation requires an account
-▎with repository write access…
+▎Sangoma Switchvox contains a SQL injection vulnerability which
+▎allows an unauthenticated remote attacker to execute arbitrary SQL
+▎statements against the backend PostgreSQL database…
 
-Vendor: Gitea
-Product: Gitea Enterprise
-EPSS: 86.8% (percentile 99)
-CWE: CWE-94, CWE-78
-Published: 2026-08-26
+Vendor: Sangoma
+Product: Switchvox
+CWE: CWE-89
+Exploitability: 3.9 / 3.9 · Impact: 5.9 / 6.0
+Published: 2026-08-14 17:15 UTC
+Patch by: 2026-09-05
 
-EUVD · CVE Record
+🛠️ Required action: Apply remediations or mitigations per vendor
+instructions or discontinue use of the product if remediation or
+mitigations are unavailable.
+
+Evidence · Evidence 2 +30
 ```
+
+**Cada línea sale de VulnCheck.** De la ficha del catálogo de KEV: el título, la descripción,
+el fabricante, el producto, las CWE, la fecha en que entró, la de CISA si además la confirmó,
+el plazo de parcheo, la acción recomendada y las pruebas de explotación. De su índice
+`nist-nvd2`: el CVSS, sus dos subíndices y la fecha de publicación. De las métricas manda la
+versión más alta que traiga —4.0 antes que 3.1— y, a igualdad de versión, la del asignador.
+
+**Los subíndices van contra su tope**, que es lo que los hace legibles: un 1.8 de
+explotabilidad no dice nada, un `1.8 / 3.9` dice que cuesta llegar. Separan dos cosas que el
+score junta —lo fácil que es explotarla y lo que se lleva por delante— y no se mezclan entre
+métricas: los dos salen de la misma que da la puntuación. Los topes cambian con la versión
+(la 2.0 puntúa los dos sobre 10) y la 4.0 no los publica, así que ahí la línea no sale.
+
+**La fecha de publicación lleva hora y dice que es UTC.** El NVD la sirve sin marca horaria,
+y una fecha a secas hace pensar que la vulnerabilidad lleva un día entero fuera cuando puede
+llevar veinte minutos.
+
+**La acción recomendada** va entre los datos y los enlaces, que es donde le toca: lo de
+arriba explica por qué corre prisa y esto dice qué se hace con ello. Es el campo
+`required_action` **tal cual lo sirve el catálogo**: no se resume ni se reescribe, solo se
+colapsan los espacios. El ejemplo de arriba es uno de sus textos literales.
+
+Es plantilla —19 valores distintos para 1.000 entradas, y uno solo cubre dos tercios— pero
+los hay de 488 caracteres, así que `TG_ACCION_MAX` (600) está para que uno futuro más largo
+no se coma el margen hasta los 4.096 de un mensaje. Hoy no recorta ninguno.
+
+Tres cosas que no daba ninguna otra fuente y ahora salen: **el uso conocido en campañas de
+ransomware**, **la detección en los señuelos de VulnCheck** y **el plazo de parcheo**, que en
+una lista de cosas que ya se están explotando es el único dato con una fecha límite de
+verdad.
+
+Y una que se ha ido: **la EPSS**, que la sirve FIRST y VulnCheck no. Tampoco pintaba mucho
+—en un mensaje que solo habla de lo ya explotado, una probabilidad de que llegue a
+explotarse sobra—, y la tabla la sigue enseñando.
+
+El CVSS se pide **una petición por CVE, y solo de lo que de verdad se manda**: con el filtro
+puesto son unos pocos por pasada, muy lejos de las 1.000 por minuto que deja el tier
+community, así que no hace falta ni paginar ni cachear en disco.
 
 **Los mensajes van en inglés.** Es el idioma de las fuentes —el título sale de cve.org, las
 CWE de MITRE, los catálogos de CISA y ENISA—, así que traducir el envoltorio dejaba cada
@@ -355,29 +442,35 @@ enlaces. La cabecera va primera porque es lo único que se lee en la notificaci�
 y el identificador va en monoespaciada para poder copiarlo de un toque, que es lo primero
 que se hace con un CVE.
 
-Cada dato se calla si no lo hay, que es mejor que una fila con un guion: la EPSS
-solo aparece si FIRST ya tiene dato —lo recién publicado no lo tiene, y un 0 sería mentir—;
-el producto solo si difiere del fabricante; el CVSS solo si la EUVD lo ha puesto, que si no
-la cabecera se queda en `Unscored`; y el enlace a cve.org, solo si la fila tiene CVE.
+Cada dato se calla si no lo hay, que es mejor que una fila con un guion: el producto solo si
+difiere del fabricante; el plazo y la acción, solo si el catálogo los trae; los subíndices,
+solo si la versión del CVSS los publica; el CVSS solo si el NVD de VulnCheck lo tiene, que si
+no la cabecera se queda en `Unscored`.
 
-**El primer enlace es la ficha de la EUVD**, que es de donde sale el CVSS del mensaje. Antes
-iba al NVD, pero mandar a una ficha que puntuaba otra cosa —o que sigue en "Awaiting
-Analysis"— era justo lo que hacía dudar del número.
+**La línea de abajo son las referencias de VulnCheck y nada más**: las de
+`vulncheck_reported_exploitation`, con las que sostiene que se está explotando. Unas son el
+informe de quien lo vio, otras el aviso del fabricante, y son lo que se abre para verificar
+el aviso.
+
+Ni la ficha de la EUVD —iba primera por ser de donde salía el CVSS, y el CVSS ya no sale de
+ahí— ni el registro del CVE: el identificador está arriba en monoespaciada, que es lo que se
+copia. El catálogo trae **32 referencias de media** por CVE, así que se enseñan
+`TG_EVIDENCIAS_VISIBLES` (2) y el resto se resume en un `+n`, igual que las CWE.
 
 Las **CWE van enlazadas a cwe.mitre.org**, con el mismo tope de tres visibles y el mismo
 `+n` que la tabla: en la pantalla de un móvil, seis identificadores seguidos ocupan más que
 todo lo demás junto. Se descarta lo que no sea un `CWE-<número>` —los `NVD-CWE-noinfo` y
-compañía—, que no tiene página a la que enlazar.
+compañía—, que no tiene página a la que enlazar. Mandan las del catálogo de KEV, que van a la
+causa de lo que se está explotando; las del NVD entran solo si el catálogo no trae ninguna.
 
 **La descripción va en una cita plegable.** La mediana son 361 caracteres pero hay de 4.000,
 así que por encima de `TG_DESC_PLEGABLE` (300) Telegram la colapsa y deja el resto del
 mensaje a la vista; se despliega tocándola. `TG_DESC_MAX` (3.000) es un tope duro, porque un
 mensaje entero no puede pasar de los 4.096 que admite la API. Los saltos de línea a media
-frase que trae la EUVD se normalizan antes.
+frase se normalizan antes.
 
-Y cuando cve.org no tiene título —una de cada cuatro filas—, `nombre` es el primer trozo de
-la propia descripción. En ese caso el mensaje **no repite la frase**: se queda solo con la
-descripción, que además viene entera.
+Y cuando el nombre que da el catálogo es el primer trozo de su propia descripción, el mensaje
+**no repite la frase**: se queda solo con la descripción, que viene entera.
 
 ### Cuando una CVE cambia después de avisada
 
@@ -559,6 +652,16 @@ En `euvd_sync.mjs` y `euvd_sync.php` (los nombres son equivalentes en ambos):
 - `VISTAS_OLVIDO_DIAS` — cuánto se recuerda una entrada que ha dejado de aparecer. **No lo
   bajes de `VENTANA_DIAS`**: olvidar antes de que la EUVD deje de devolverla es reingerirla
   entera. Ver "Lo que el feed ya ha visto".
+- `VULNCHECK_SIEMBRA_DIAS` — cuánto hacia atrás se siembra lo que solo consta en VulnCheck.
+  Subirlo engorda la tabla y la pasada sin ganar avisos: por encima de `TG_DIAS_NOTICIA` (7)
+  lo que entra ya no se avisa, solo se publica.
+- `TG_EVIDENCIAS_VISIBLES` — referencias de explotación enlazadas en el mensaje, que son los
+  únicos enlaces que lleva. 2 llegan para verificarlo; el catálogo trae 32 de media por CVE,
+  y las que no caben se cuentan en el `+n`.
+- `TG_ACCION_MAX` — tope de la acción recomendada. La más larga que sirve hoy el catálogo
+  mide 520 caracteres.
+- `TG_CVSS_TOPES` — a cuánto llega cada subíndice en cada versión del CVSS. Solo se toca si
+  el NVD empieza a publicar subíndices de la 4.0.
 - `TELEGRAM_PAUSA` — variable de entorno, no constante; ver "El freno de mano".
 - `PAUSA_US` / `PAUSA_MS` — pausa entre peticiones. No lo bajes de 0,3 s.
 - `CONCURRENCIA_TITULOS` — peticiones simultáneas a cve.org. 6 va sobrado; subirlo
@@ -568,6 +671,10 @@ En `euvd_sync.mjs` y `euvd_sync.php` (los nombres son equivalentes en ambos):
 - `NVD_API_KEY` — variable de entorno opcional, solo para la descarga de CWE. Sin ella el
   NVD deja 5 peticiones cada 30 s; con ella, 50. Se pide gratis en
   <https://nvd.nist.gov/developers/request-an-api-key> Es el secreto `NVD_API_KEY` del repo.
+- `VULNCHECK_API_TOKEN` — variable de entorno. Es de lo que vive Telegram: decide qué se
+  avisa y de dónde sale el texto. Sin ella la web sale igual pero no se avisa nada. Se pide
+  gratis en <https://vulncheck.com> (tier community). Es el secreto `VULNCHECK_API_TOKEN`
+  del repo.
 
 Con la ventana entera, más las ~1.300 que siembra el catálogo de KEV, el JSON ronda los
 7,5 MB, así que **sirve el `data/` con gzip**
@@ -676,14 +783,26 @@ Y no se solapan tanto como parecería. De las filas del feed que constan en KEV,
 andan **por debajo del 1 % de EPSS** — CVE con explotación confirmada que, ordenando por
 EPSS, no salen ni en la página veinte. Por eso van marcadas aparte y no como un EPSS alto.
 
-Sale de `https://euvdservices.enisa.europa.eu/api/kev/dump`, que consolida CISA KEV y EU KEV
-en una sola respuesta sin paginar: una petición por ejecución, ~1.700 entradas. Se cruza por
-`cveId` y, si no, por `euvdId`. Las filas que caen dentro llevan
-`kev: { fecha, fuentes }` (`fuentes` es `cisa_kev`, `eukev_kev` o las dos), borde izquierdo
-rojo, un distintivo "Explotada" junto al CVE y un chip de filtro propio en la barra.
+Salen de dos sitios. `https://euvdservices.enisa.europa.eu/api/kev/dump` consolida CISA KEV
+y EU KEV en una sola respuesta sin paginar: una petición, ~1.700 entradas, cruzadas por
+`cveId` y, si no, por `euvdId`. Y `https://api.vulncheck.com/v3/index/vulncheck-kev` trae
+el de VulnCheck: ~5.200 entradas, seis peticiones de 1.000 con `Authorization: Bearer`, y se
+cruza solo por CVE, que es lo único que da.
 
-Si el catálogo no responde, las filas se quedan sin marcar y el resto del sync sigue: es
-un dato que suma, no uno del que dependa la tabla.
+Las filas que caen en cualquiera de los dos llevan `kev: { fecha, fuentes }` —`fuentes` es
+`vulncheck_kev`, `cisa_kev`, `eukev_kev` o varias—, borde izquierdo rojo, un distintivo
+"Explotada" junto al CVE y un chip de filtro propio en la barra. Cuando los dos catálogos la
+traen, **manda la fecha más antigua**: lo que importa es desde cuándo consta explotada, no
+cuál de los dos se enteró el último.
+
+El tier community de VulnCheck es gratis y basta: 1.000 peticiones por minuto contra las seis
+que se hacen. Lo único que corta es la paginación, que se para en 6 páginas; hoy sobran, y el
+sync avisa en el log en cuanto el catálogo no quepa, porque a partir de ahí el filtro de
+Telegram se dejaría fuera lo que no haya bajado.
+
+Si un catálogo no responde, las filas se quedan sin su marca y el resto del sync sigue: para
+la tabla es un dato que suma, no uno del que dependa. Para Telegram no, porque el de VulnCheck
+es el que decide qué se avisa y con qué texto; ver "Todo sale de VulnCheck".
 
 ### El catálogo también trae filas, no solo marcas
 
@@ -696,8 +815,19 @@ Así que el catálogo siembra: de cada entrada que no venga en la ventana se pid
 mismos enriquecidos que el resto (título de cve.org, CWE, EPSS); las CWE del NVD sí se las
 pierde, porque esas se piden por ventana de publicación y cve.org es la fuente principal.
 
+Del catálogo de la EUVD se siembra todo. Del de VulnCheck, **solo lo añadido en los últimos
+`VULNCHECK_SIEMBRA_DIAS` (14)**: son ~3.500 CVE que la EUVD no marca, casi todas de hace
+años, y pedir sus fichas una a una serían veinte minutos por pasada para triplicar la tabla
+con cosas que no son noticia. Lo que hace falta es lo que acaba de entrar, que además es lo
+único que `TG_DIAS_NOTICIA` deja avisar. Y hace falta de verdad: de lo que VulnCheck añadió
+en una semana real, **la mayoría eran CVE de 2023 a 2025** que la ventana no alcanza — sin
+sembrarlas no habría fila, y sin fila no hay aviso por muy explotadas que estén.
+
+Como VulnCheck no da ids de la EUVD, esas fichas se piden por CVE. `/api/enisaid?id=…` acepta
+las dos cosas, así que el resto del camino es el mismo.
+
 Las fichas se guardan en `data/kev_extra.json` y la caché se poda con el catálogo: lo que
-CISA o la EUVD retiran deja de publicarse aquí también.
+CISA, la EUVD o VulnCheck retiran deja de publicarse aquí también.
 
 El recuento de la cabecera lo dice separado ("N in the last 14 days + M older") y en el JSON
 está `fueraDeVentana` con cuántas son. `totalEnEuvd` sigue siendo lo que la EUVD dice tener

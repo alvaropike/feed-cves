@@ -215,6 +215,9 @@ jobs:
         env:
           MODO: ${{ steps.modo.outputs.modo }}
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          # Sin esta clave el sync publica la web igual, pero no avisa por Telegram:
+          # el filtro no puede decidir qué es explotado sin el catálogo de VulnCheck.
+          VULNCHECK_API_TOKEN: ${{ secrets.VULNCHECK_API_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_KEV: ${{ secrets.TELEGRAM_CHAT_KEV }}
           TELEGRAM_CHAT_CRITICAS: ${{ secrets.TELEGRAM_CHAT_CRITICAS }}
