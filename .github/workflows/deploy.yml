@@ -145,8 +145,6 @@ jobs:
           ENLACE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_AVISOS: ${{ secrets.TELEGRAM_CHAT_AVISOS }}
-          TELEGRAM_CHAT_KEV: ${{ secrets.TELEGRAM_CHAT_KEV }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           aviso="🔴 <b>El despliegue del front ha fallado</b>"
           aviso="$aviso\nLa web sigue con la versión anterior; los datos no se tocan, esos van por su workflow."

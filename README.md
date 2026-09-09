@@ -96,7 +96,7 @@ Los secretos van en Settings → Secrets and variables → Actions:
 | `VULNCHECK_API_TOKEN` | de lo que sale por Telegram: qué se avisa y con qué texto. Sin él la web sale igual pero no se avisa nada |
 | `TELEGRAM_BOT_TOKEN` | opcional; sin él el sync corre igual y no avisa |
 | `TELEGRAM_CHAT_KEV`, `_CRITICAS`, `_ALTAS`, `_MEDIAS`, `_BAJAS`, `_SIN_PUNTUAR` | una sala por criticidad; ver "Avisos por Telegram" |
-| `TELEGRAM_CHAT_AVISOS` | opcional; sala de guardia para los fallos de la pasada, ver "Cuando algo se rompe" |
+| `TELEGRAM_CHAT_AVISOS` | sala de guardia para los fallos de la pasada. Sin él **no se avisa de nada**: ya no cae en la sala de KEV, ver "Cuando algo se rompe" |
 
 Y una **variable** del repo (Settings → Variables), que no es un secreto porque es una URL
 pública: `SITIO_URL`, la raíz del feed publicado (`https://tu-subdominio.example/`). La usa
@@ -156,8 +156,14 @@ montado:
   6 h. Seis horas de retraso, frente a no enterarse nunca.
 
 Los dos salen con 0 pase lo que pase: un chivato que tumba la pasada por no poder leer una
-cabecera hace más daño que el fallo que vigila. Y sin `TELEGRAM_CHAT_AVISOS` el aviso cae en
-la sala de KEV, o en `TELEGRAM_CHAT_ID`, para que un montaje sin sala propia se entere igual.
+cabecera hace más daño que el fallo que vigila.
+
+**Sin `TELEGRAM_CHAT_AVISOS` no se manda nada.** Antes el aviso caía en la sala de KEV, o en
+`TELEGRAM_CHAT_ID`, para que un montaje sin sala propia se enterase igual; el precio era
+meter avisos de operación —"la pasada ha fallado"— entre los de vulnerabilidades, y a ese
+grupo solo deben llegar los de vulnerabilidades. Así que el respaldo se quitó: **si no montas
+la sala de guardia, una pasada rota es silenciosa** y solo se ve en el log del run y en el
+resumen del job. Montarla es un secreto más.
 
 ## Dos cadencias: pasada rápida y pasada completa
 

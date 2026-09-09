@@ -6,12 +6,15 @@
 #
 #   sh .github/avisar.sh "texto en HTML de Telegram"
 #
-# El destino sale de TELEGRAM_CHAT_AVISOS y, si no está puesto, de la sala de KEV
-# o del grupo de respaldo, para que un montaje que no haya creado sala propia
-# siga enterándose. Sin token o sin destino no manda nada, lo deja escrito en el
-# log y sale con 0: un aviso que no se puede entregar no debe además tumbar el
-# job que lo lanzaba, y menos cuando ese job ya venía fallando y esto es lo
-# último que corre.
+# El destino es TELEGRAM_CHAT_AVISOS y solo ese. Antes caía en la sala de KEV o
+# en el grupo de respaldo cuando no había sala propia, y eso metía avisos de
+# operación —"la pasada ha fallado"— entre los de vulnerabilidades, que es lo
+# único que debe llegar a ese grupo. Ahora, sin sala de guardia, no se manda:
+# queda en el log del run y en el resumen del job.
+#
+# Sin token o sin destino sale con 0: un aviso que no se puede entregar no debe
+# además tumbar el job que lo lanzaba, y menos cuando ese job ya venía fallando
+# y esto es lo último que corre.
 
 set -u
 
@@ -23,11 +26,9 @@ fi
 
 token="${TELEGRAM_BOT_TOKEN:-}"
 destino="${TELEGRAM_CHAT_AVISOS:-}"
-[ -n "$destino" ] || destino="${TELEGRAM_CHAT_KEV:-}"
-[ -n "$destino" ] || destino="${TELEGRAM_CHAT_ID:-}"
 
 if [ -z "$token" ] || [ -z "$destino" ]; then
-  echo "avisar.sh: sin TELEGRAM_BOT_TOKEN o sin ningún destino; el aviso se queda sin mandar:"
+  echo "avisar.sh: sin TELEGRAM_BOT_TOKEN o sin TELEGRAM_CHAT_AVISOS; el aviso se queda sin mandar:"
   echo "  $texto"
   exit 0
 fi

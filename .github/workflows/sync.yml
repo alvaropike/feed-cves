@@ -88,8 +88,6 @@ jobs:
           MODO: ${{ steps.modo.outputs.modo }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_AVISOS: ${{ secrets.TELEGRAM_CHAT_AVISOS }}
-          TELEGRAM_CHAT_KEV: ${{ secrets.TELEGRAM_CHAT_KEV }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           if [ -z "$SITIO_URL" ]; then
             echo "Sin la variable SITIO_URL: el chivato de frescura está apagado." \
@@ -294,8 +292,6 @@ jobs:
           ENLACE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_AVISOS: ${{ secrets.TELEGRAM_CHAT_AVISOS }}
-          TELEGRAM_CHAT_KEV: ${{ secrets.TELEGRAM_CHAT_KEV }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           aviso="🔴 <b>La pasada $MODO ha fallado</b>"
           aviso="$aviso\nLa web se queda con lo último que se publicó bien; no se ha perdido nada."
